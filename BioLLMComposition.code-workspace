@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../Projects/proteinDNA_data"
+		},
+		{
+			"path": "../BioLLMComposition_Tanner"
+		},
+		{
+			"path": "../PRODNAComposition"
+		}
+	],
+	"settings": {}
+}

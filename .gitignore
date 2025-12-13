@@ -1,0 +1,9 @@
+*.out
+*.pdb
+*.png
+*.jpg
+*.pth
+*.json
+
+__pycache__/
+.env
