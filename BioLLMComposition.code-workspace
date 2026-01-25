@@ -13,5 +13,7 @@
 			"path": "../PRODNAComposition"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"python.languageServer": "None"
+	}
 }

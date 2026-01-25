@@ -33,7 +33,7 @@ patch -p1 < /path/to/dnabert_triton_fix.patch
 Or use the provided shell script:
 
 ```bash
-./apply_patch.sh
+·
 ```
 
 ### Option 2: Run the Python patch script
