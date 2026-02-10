@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.model_selection import GroupShuffleSplit
+from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef, accuracy_score, precision_score, recall_score, f1_score
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ExponentialLR
 from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, BertConfig
@@ -201,15 +202,121 @@ test_dataset = DNAProteinDataset(dna_embs_val, protein_embs_val, np.array(val_la
                                   dna_tokens_val, prot_tokens_val)
 test_dataloader = DataLoader(test_dataset, batch_size=BATCHSIZE, shuffle=True)
 
-# Initialize results storage
+# Initialize results storage with metrics
 results = {
-    'Protein only': [],
-    'DNA only': [],
-    'Concatenation': [],
-    'Contrastive': [],
-    'Attention': [],
-    'Composition': []
+    'Protein only': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'DNA only': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Concatenation': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Contrastive': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Attention': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Composition': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
 }
+
+
+def compute_metrics(y_true, y_pred, y_prob):
+    """
+    Compute evaluation metrics: Accuracy, ROC-AUC, PR-AUC, MCC, Precision, Recall, F1.
+    
+    Args:
+        y_true: Ground truth labels (0 or 1)
+        y_pred: Predicted labels (0 or 1)
+        y_prob: Predicted probabilities for positive class
+        
+    Returns:
+        dict with accuracy, roc_auc, pr_auc, mcc, precision, recall, f1
+    """
+    acc = accuracy_score(y_true, y_pred)
+    
+    # Handle edge case where only one class is present
+    roc_auc = roc_auc_score(y_true, y_prob)
+    
+    pr_auc = average_precision_score(y_true, y_prob)
+    
+    mcc = matthews_corrcoef(y_true, y_pred)
+    
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    
+    return {
+        'accuracy': acc,
+        'roc_auc': roc_auc,
+        'pr_auc': pr_auc,
+        'mcc': mcc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+
+
+def evaluate_model(model, dataloader, model_type='standard'):
+    """
+    Evaluate model on dataloader and compute all metrics.
+    
+    Args:
+        model: The model to evaluate
+        dataloader: DataLoader for evaluation
+        model_type: 'protein_only', 'dna_only', 'concat', 'contrastive', 
+                   'attention', or 'composition'
+    
+    Returns:
+        dict with all metrics
+    """
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            dna_embs, protein_embs, labels, dna_tokens, prot_tokens = batch
+            labels_np = labels.numpy().astype(int)
+            
+            if model_type == 'protein_only':
+                protein_embs = protein_embs.to(device)
+                outputs = model(protein_embs)
+                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                
+            elif model_type == 'dna_only':
+                dna_embs = dna_embs.to(device)
+                outputs = model(dna_embs)
+                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                
+            elif model_type == 'concat':
+                inputs = torch.cat((dna_embs, protein_embs), dim=1).to(device)
+                outputs = model(inputs)
+                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                
+            elif model_type == 'contrastive':
+                dna_embs, protein_embs = dna_embs.to(device), protein_embs.to(device)
+                dna_out, prot_out = model(dna_embs, protein_embs)
+                similarities = torch.nn.functional.cosine_similarity(dna_out, prot_out, dim=1)
+                # Map similarities [-1, 1] to probabilities [0, 1] using (sim + 1) / 2
+                # This is more appropriate than sigmoid for cosine similarity
+                probs = ((similarities + 1) / 2).cpu().numpy()
+                # Predict positive (1) if similarity > 0, else negative (0)
+                preds = (similarities > 0).long().cpu().numpy()
+                
+            elif model_type in ['attention', 'composition']:
+                outputs, _ = model(dna_tokens, prot_tokens)
+                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+            
+            else:
+                raise ValueError(f"Unknown model_type: {model_type}")
+            
+            all_labels.extend(labels_np)
+            all_preds.extend(preds)
+            all_probs.extend(probs)
+    
+    all_labels = np.array(all_labels, dtype=int)
+    all_preds = np.array(all_preds, dtype=int)
+    all_probs = np.array(all_probs, dtype=float)
+    
+    return compute_metrics(all_labels, all_preds, all_probs)
 
 # ==============================================================================
 # Train model on protein embeddings only
@@ -226,7 +333,8 @@ for n in range(3):
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
-    best_test_acc = 0
+    best_metrics = None
+    best_roc_auc = -1  # Start at -1 to ensure first epoch always updates
     for epoch in tqdm(range(EPOCHS)):
         model.train()
         train_loss = 0.0
@@ -249,31 +357,22 @@ for n in range(3):
         train_loss /= total
         train_accuracy = correct / total
 
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
+        # Evaluate with all metrics
+        metrics = evaluate_model(model, test_dataloader, model_type='protein_only')
+        
+        if metrics['roc_auc'] > best_roc_auc:
+            best_roc_auc = metrics['roc_auc']
+            best_metrics = metrics
+            torch.save(model.state_dict(), "./results/protein_emb_model.pth")
+        if VERBOSE: 
+            print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
+                  f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
-        with torch.no_grad():
-            for batch in test_dataloader:
-                _, protein_embs, labels, _, _ = batch
-                protein_embs, labels = protein_embs.to(device), labels.to(device)
-                outputs = model(protein_embs)
-                loss = criterion(outputs, labels)
-                test_loss += loss.item() * labels.size(0)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-            test_loss /= total
-            test_accuracy = correct / total
-
-            if test_accuracy > best_test_acc:
-                best_test_acc = test_accuracy
-                torch.save(model.state_dict(), "protein_emb_model.pth")
-            if VERBOSE: print(f"Epoch {epoch + 1}, Train Accuracy: {train_accuracy:.4f}, Test Accuracy: {test_accuracy:.4f}")
-
-    print(f"Run {n+1}: {best_test_acc:.4f}")
-    results['Protein only'].append(best_test_acc)
+    print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
+          f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
+          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        results['Protein only'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
 # Train model on DNA embeddings only
@@ -290,7 +389,8 @@ for n in range(3):
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
-    best_test_acc = 0
+    best_metrics = None
+    best_roc_auc = -1  # Start at -1 to ensure first epoch always updates
     for epoch in tqdm(range(EPOCHS)):
         model.train()
         train_loss = 0.0
@@ -313,31 +413,22 @@ for n in range(3):
         train_loss /= total
         train_accuracy = correct / total
 
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
+        # Evaluate with all metrics
+        metrics = evaluate_model(model, test_dataloader, model_type='dna_only')
+        
+        if metrics['roc_auc'] > best_roc_auc:
+            best_roc_auc = metrics['roc_auc']
+            best_metrics = metrics
+            torch.save(model.state_dict(), "./results/dna_emb_model.pth")
+        if VERBOSE: 
+            print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
+                  f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
-        with torch.no_grad():
-            for batch in test_dataloader:
-                dna_embs, _, labels, _, _ = batch
-                dna_embs, labels = dna_embs.to(device), labels.to(device)
-                outputs = model(dna_embs)
-                loss = criterion(outputs, labels)
-                test_loss += loss.item() * labels.size(0)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-            test_loss /= total
-            test_accuracy = correct / total
-
-            if test_accuracy > best_test_acc:
-                best_test_acc = test_accuracy
-                torch.save(model.state_dict(), "dna_emb_model.pth")
-            if VERBOSE: print(f"Epoch {epoch + 1}, Train Accuracy: {train_accuracy:.4f}, Test Accuracy: {test_accuracy:.4f}")
-
-    print(f"Run {n+1}: {best_test_acc:.4f}")
-    results['DNA only'].append(best_test_acc)
+    print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
+          f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
+          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        results['DNA only'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
 # Train model on concatenated embeddings
@@ -355,7 +446,8 @@ for n in range(3):
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
-    best_test_acc = 0
+    best_metrics = None
+    best_roc_auc = -1  # Start at -1 to ensure first epoch always updates
     for epoch in tqdm(range(EPOCHS)):
         model.train()
         train_loss = 0.0
@@ -379,32 +471,22 @@ for n in range(3):
         train_loss /= total
         train_accuracy = correct / total
 
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
+        # Evaluate with all metrics
+        metrics = evaluate_model(model, test_dataloader, model_type='concat')
+        
+        if metrics['roc_auc'] > best_roc_auc:
+            best_roc_auc = metrics['roc_auc']
+            best_metrics = metrics
+            torch.save(model.state_dict(), "./results/concat_model.pth")
+        if VERBOSE: 
+            print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
+                  f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
-        with torch.no_grad():
-            for batch in test_dataloader:
-                dna_embs, protein_embs, labels, _, _ = batch
-                inputs = torch.cat((dna_embs, protein_embs), dim=1)
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                test_loss += loss.item() * labels.size(0)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-            test_loss /= total
-            test_accuracy = correct / total
-
-            if test_accuracy > best_test_acc:
-                best_test_acc = test_accuracy
-                torch.save(model.state_dict(), "concat_model.pth")
-            if VERBOSE: print(f"Epoch {epoch + 1}, Train Accuracy: {train_accuracy:.4f}, Test Accuracy: {test_accuracy:.4f}")
-
-    print(f"Run {n+1}: {best_test_acc:.4f}")
-    results['Concatenation'].append(best_test_acc)
+    print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
+          f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
+          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        results['Concatenation'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
 # Contrastive Learning Model
@@ -447,7 +529,8 @@ for n in range(3):
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CosineEmbeddingLoss()
 
-    best_test_acc = 0
+    best_metrics = None
+    best_roc_auc = -1  # Start at -1 to ensure first epoch always updates
     for epoch in tqdm(range(EPOCHS)):
         model.train()
         train_loss = 0.0
@@ -474,36 +557,22 @@ for n in range(3):
         train_loss /= total
         train_accuracy = correct / total
 
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
+        # Evaluate with all metrics
+        metrics = evaluate_model(model, test_dataloader, model_type='contrastive')
+        
+        if metrics['roc_auc'] > best_roc_auc:
+            best_roc_auc = metrics['roc_auc']
+            best_metrics = metrics
+            torch.save(model.state_dict(), "./results/contrastive_model.pth")
+        if VERBOSE: 
+            print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
+                  f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
-        with torch.no_grad():
-            for batch in test_dataloader:
-                dna_embs, protein_embs, labels, _, _ = batch
-                labels = labels.clone()
-                labels[labels == 0] = -1
-
-                dna_embs, protein_embs, labels = dna_embs.to(device), protein_embs.to(device), labels.to(device)
-                dna_out, prot_out = model(dna_embs, protein_embs)
-                loss = criterion(dna_out, prot_out, labels)
-
-                test_loss += loss.item() * labels.size(0)
-                similarities = CosineSimilarity(dim=1, eps=1e-6)(dna_out, prot_out)
-                preds = (similarities > 0).long() * 2 - 1
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-            test_loss /= total
-            test_accuracy = correct / total
-
-            if test_accuracy > best_test_acc:
-                best_test_acc = test_accuracy
-                torch.save(model.state_dict(), "contrastive_model.pth")
-            if VERBOSE: print(f"Epoch {epoch + 1}, Train Accuracy: {train_accuracy:.4f}, Test Accuracy: {test_accuracy:.4f}")
-
-    print(f"Run {n+1}: {best_test_acc:.4f}")
-    results['Contrastive'].append(best_test_acc)
+    print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
+          f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
+          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        results['Contrastive'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
 # Attention Model
@@ -596,7 +665,8 @@ for n in range(3):
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
-    best_test_acc = 0
+    best_metrics = None
+    best_roc_auc = -1  # Start at -1 to ensure first epoch always updates
     for epoch in tqdm(range(EPOCHS)):
         model.train()
         train_loss = 0.0
@@ -619,32 +689,22 @@ for n in range(3):
         train_loss /= total
         train_accuracy = correct / total
 
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
-
-        with torch.no_grad():
-            for batch in test_dataloader:
-                _, _, labels, dna_tokens, prot_tokens = batch
-                labels = labels.to(device)
-                outputs, _ = model(dna_tokens, prot_tokens)
-                loss = criterion(outputs, labels)
-
-                test_loss += loss.item() * labels.size(0)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-            test_loss /= total
-            test_accuracy = correct / total
-
-        if test_accuracy > best_test_acc:
-            best_test_acc = test_accuracy
-            torch.save(model.state_dict(), "attention_model.pth")
-        if VERBOSE: print(f"Epoch {epoch + 1}, Train Accuracy: {train_accuracy:.4f}, Test Accuracy: {test_accuracy:.4f}")
+        # Evaluate with all metrics
+        metrics = evaluate_model(model, test_dataloader, model_type='attention')
+        
+        if metrics['roc_auc'] > best_roc_auc:
+            best_roc_auc = metrics['roc_auc']
+            best_metrics = metrics
+            torch.save(model.state_dict(), "./results/attention_model.pth")
+        if VERBOSE: 
+            print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
+                  f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
     
-    print(f"Run {n+1}: {best_test_acc:.4f}")
-    results['Attention'].append(best_test_acc)
+    print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
+          f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
+          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        results['Attention'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
 # Composition Model
@@ -754,7 +814,8 @@ for n in range(3):
     optim = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss()
 
-    best_test_acc = 0
+    best_metrics = None
+    best_roc_auc = -1  # Start at -1 to ensure first epoch always updates
     for epoch in tqdm(range(EPOCHS)):
         model.train()
         train_loss = 0.0
@@ -777,49 +838,71 @@ for n in range(3):
         train_loss /= total
         train_accuracy = correct / total
 
-        model.eval()
-        test_loss = 0.0
-        correct = 0
-        total = 0
+        # Evaluate with all metrics
+        metrics = evaluate_model(model, test_dataloader, model_type='composition')
+        
+        if metrics['roc_auc'] > best_roc_auc:
+            best_roc_auc = metrics['roc_auc']
+            best_metrics = metrics
+            torch.save(model.state_dict(), "./results/comp_model.pth")
+        if VERBOSE: 
+            print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
+                  f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
-        with torch.no_grad():
-            for batch in test_dataloader:
-                _, _, labels, dna_tokens, prot_tokens = batch
-                labels = labels.to(device)
-                outputs, _ = model(dna_tokens, prot_tokens)
-                loss = criterion(outputs, labels)
-                test_loss += loss.item() * labels.size(0)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted == labels).sum().item()
-                total += labels.size(0)
-        test_loss /= total
-        test_accuracy = correct / total
-
-        if test_accuracy > best_test_acc:
-            best_test_acc = test_accuracy
-            # torch.save(model.state_dict(), "comp_model.pth")
-        if VERBOSE: print(f"Epoch {epoch + 1}, Train Accuracy: {train_accuracy:.4f}, Test Accuracy: {test_accuracy:.4f}")
-
-    print(f"Run {n+1}: {best_test_acc:.4f}")
-    results['Composition'].append(best_test_acc)
+    print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
+          f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
+          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        results['Composition'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
 # Save Results
 # ==============================================================================
 
-df_results = pd.DataFrame({
-    'Model': list(results.keys()),
-    'Run 1': [results[k][0] if len(results[k]) > 0 else None for k in results.keys()],
-    'Run 2': [results[k][1] if len(results[k]) > 1 else None for k in results.keys()],
-    'Run 3': [results[k][2] if len(results[k]) > 2 else None for k in results.keys()],
-})
-df_results['Mean'] = df_results[['Run 1', 'Run 2', 'Run 3']].mean(axis=1)
-df_results['Std'] = df_results[['Run 1', 'Run 2', 'Run 3']].std(axis=1)
+# Create comprehensive results dataframe with all metrics
+rows = []
+for model_name, metrics_dict in results.items():
+    for metric_name, values in metrics_dict.items():
+        row = {
+            'Model': model_name,
+            'Metric': metric_name,
+            'Run 1': values[0] if len(values) > 0 else None,
+            'Run 2': values[1] if len(values) > 1 else None,
+            'Run 3': values[2] if len(values) > 2 else None,
+        }
+        if len(values) >= 3:
+            row['Mean'] = np.mean(values)
+            row['Std'] = np.std(values)
+        rows.append(row)
+
+df_results = pd.DataFrame(rows)
 
 print("\n" + "="*60)
 print("Final Results")
 print("="*60)
 print(df_results.to_string(index=False))
 
-df_results.to_csv('results_tannerHP_ProteinDNA.csv', index=False)
-print("\nResults saved to results_tannerHP_ProteinDNA.csv")
+# Save detailed results
+df_results.to_csv('./results/results_tannerHP_ProteinDNA_20260201.csv', index=False)
+print("\nResults saved to ./results/results_tannerHP_ProteinDNA_20260201.csv")
+
+# Also create a summary table (mean ± std for each metric)
+print("\n" + "="*60)
+print("Summary Table (Mean ± Std)")
+print("="*60)
+
+summary_rows = []
+for model_name in results.keys():
+    row = {'Model': model_name}
+    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+        values = results[model_name][metric_name]
+        if len(values) >= 3:
+            row[metric_name] = f"{np.mean(values):.4f} ± {np.std(values):.4f}"
+        else:
+            row[metric_name] = "N/A"
+    summary_rows.append(row)
+
+df_summary = pd.DataFrame(summary_rows)
+print(df_summary.to_string(index=False))
+df_summary.to_csv('./results/results_tannerHP_ProteinDNA_summary_20260201.csv', index=False)
+print("\nSummary saved to ./results/results_tannerHP_ProteinDNA_summary_20260201.csv")
