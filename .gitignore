@@ -10,3 +10,9 @@ __pycache__/
 *.log
 *.csv
 *.pth
+runs/
+
+.ipynb_checkpoints/
+.vscode/
+.virtual_documents/
+biollmcomposition.egg-info/

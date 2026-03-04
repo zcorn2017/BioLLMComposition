@@ -12,6 +12,7 @@ to prevent data leakage (proteins clustered at 30% sequence identity).
 import math
 import torch
 import random
+import datetime
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -22,13 +23,16 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.model_selection import GroupShuffleSplit
-from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef, accuracy_score, balanced_accuracy_score, precision_score, recall_score, f1_score
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ExponentialLR
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, BertConfig
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+N_RUNS = 1
 
 SEED = 42
 random.seed(SEED)
@@ -37,14 +41,19 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 
 # Hyperparameters
-LR = 5e-4
-EPOCHS = 100
+LR = 5e-7
+EPOCHS = 200
 VERBOSE = False
 BATCHSIZE = 16
 
 # Embedding dimensions
 DNA_EMB_DIM = 768   # DNABERT-2 output dimension
 PROT_EMB_DIM = 320  # ESM2 output dimension
+
+# TensorBoard setup
+TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_DIR = f"./runs/proteinDNA_{TIMESTAMP}"
+print(f"TensorBoard log directory: {LOG_DIR}")
 
 # ==============================================================================
 # Data Loading and Splitting
@@ -204,12 +213,12 @@ test_dataloader = DataLoader(test_dataset, batch_size=BATCHSIZE, shuffle=True)
 
 # Initialize results storage with metrics
 results = {
-    'Protein only': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
-    'DNA only': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
-    'Concatenation': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
-    'Contrastive': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
-    'Attention': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
-    'Composition': {'accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Protein only': {'accuracy': [], 'balanced_accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'DNA only': {'accuracy': [], 'balanced_accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Concatenation': {'accuracy': [], 'balanced_accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Contrastive': {'accuracy': [], 'balanced_accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Attention': {'accuracy': [], 'balanced_accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
+    'Composition': {'accuracy': [], 'balanced_accuracy': [], 'precision': [], 'recall': [], 'mcc': [], 'f1': [], 'roc_auc': [], 'pr_auc': []},
 }
 
 
@@ -226,6 +235,7 @@ def compute_metrics(y_true, y_pred, y_prob):
         dict with accuracy, roc_auc, pr_auc, mcc, precision, recall, f1
     """
     acc = accuracy_score(y_true, y_pred)
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
     
     # Handle edge case where only one class is present
     roc_auc = roc_auc_score(y_true, y_prob)
@@ -240,6 +250,7 @@ def compute_metrics(y_true, y_pred, y_prob):
     
     return {
         'accuracy': acc,
+        'balanced_accuracy': bal_acc,
         'roc_auc': roc_auc,
         'pr_auc': pr_auc,
         'mcc': mcc,
@@ -251,7 +262,7 @@ def compute_metrics(y_true, y_pred, y_prob):
 
 def evaluate_model(model, dataloader, model_type='standard'):
     """
-    Evaluate model on dataloader and compute all metrics.
+    Evaluate model on dataloader and compute all metrics + validation loss.
     
     Args:
         model: The model to evaluate
@@ -260,54 +271,67 @@ def evaluate_model(model, dataloader, model_type='standard'):
                    'attention', or 'composition'
     
     Returns:
-        dict with all metrics
+        dict with all metrics including 'val_loss'
     """
     model.eval()
     all_labels = []
     all_preds = []
     all_probs = []
+    total_loss = 0.0
+    total_samples = 0
+
+    # Use matching loss for each model type
+    ce_loss_fn = nn.CrossEntropyLoss(reduction='sum')
+    cos_loss_fn = nn.CosineEmbeddingLoss(reduction='sum')
     
     with torch.no_grad():
         for batch in dataloader:
             dna_embs, protein_embs, labels, dna_tokens, prot_tokens = batch
             labels_np = labels.numpy().astype(int)
+            batch_size = labels.size(0)
             
             if model_type == 'protein_only':
                 protein_embs = protein_embs.to(device)
                 outputs = model(protein_embs)
+                total_loss += ce_loss_fn(outputs, labels.to(device)).item()
                 probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 
             elif model_type == 'dna_only':
                 dna_embs = dna_embs.to(device)
                 outputs = model(dna_embs)
+                total_loss += ce_loss_fn(outputs, labels.to(device)).item()
                 probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 
             elif model_type == 'concat':
                 inputs = torch.cat((dna_embs, protein_embs), dim=1).to(device)
                 outputs = model(inputs)
+                total_loss += ce_loss_fn(outputs, labels.to(device)).item()
                 probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
                 
             elif model_type == 'contrastive':
                 dna_embs, protein_embs = dna_embs.to(device), protein_embs.to(device)
                 dna_out, prot_out = model(dna_embs, protein_embs)
+                # CosineEmbeddingLoss expects labels in {-1, 1}
+                cos_labels = labels.clone()
+                cos_labels[cos_labels == 0] = -1
+                total_loss += cos_loss_fn(dna_out, prot_out, cos_labels.to(device)).item()
                 similarities = torch.nn.functional.cosine_similarity(dna_out, prot_out, dim=1)
-                # Map similarities [-1, 1] to probabilities [0, 1] using (sim + 1) / 2
-                # This is more appropriate than sigmoid for cosine similarity
                 probs = ((similarities + 1) / 2).cpu().numpy()
-                # Predict positive (1) if similarity > 0, else negative (0)
                 preds = (similarities > 0).long().cpu().numpy()
                 
             elif model_type in ['attention', 'composition']:
                 outputs, _ = model(dna_tokens, prot_tokens)
+                total_loss += ce_loss_fn(outputs, labels.to(device)).item()
                 probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
                 preds = torch.argmax(outputs, dim=1).cpu().numpy()
             
             else:
                 raise ValueError(f"Unknown model_type: {model_type}")
             
+            total_samples += batch_size
             all_labels.extend(labels_np)
             all_preds.extend(preds)
             all_probs.extend(probs)
@@ -316,7 +340,85 @@ def evaluate_model(model, dataloader, model_type='standard'):
     all_preds = np.array(all_preds, dtype=int)
     all_probs = np.array(all_probs, dtype=float)
     
-    return compute_metrics(all_labels, all_preds, all_probs)
+    metrics = compute_metrics(all_labels, all_preds, all_probs)
+    metrics['val_loss'] = total_loss / total_samples
+    return metrics
+
+
+def collect_learned_embeddings(model, dataloader, model_type):
+    """Collect learned embeddings from the model on validation data for TensorBoard."""
+    model.eval()
+    all_embeddings = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            dna_embs, protein_embs, labels, dna_tokens, prot_tokens = batch
+
+            if model_type == 'protein_only':
+                all_embeddings.append(protein_embs)
+            elif model_type == 'dna_only':
+                all_embeddings.append(dna_embs)
+            elif model_type == 'concat':
+                all_embeddings.append(torch.cat((dna_embs, protein_embs), dim=1))
+            elif model_type == 'contrastive':
+                dna_embs_d = dna_embs.to(device)
+                protein_embs_d = protein_embs.to(device)
+                dna_out, prot_out = model(dna_embs_d, protein_embs_d)
+                all_embeddings.append(torch.cat((dna_out, prot_out), dim=1).cpu())
+            elif model_type in ['attention', 'composition']:
+                _, emb = model(dna_tokens, prot_tokens)
+                all_embeddings.append(emb.cpu())
+
+            all_labels.append(labels)
+
+    return torch.cat(all_embeddings, dim=0), torch.cat(all_labels, dim=0)
+
+
+def log_epoch_tb(writer, epoch, train_loss, train_accuracy, val_metrics):
+    """Log training and validation metrics for one epoch to TensorBoard."""
+    writer.add_scalar('loss/train', train_loss, epoch)
+    writer.add_scalar('loss/val', val_metrics['val_loss'], epoch)
+    writer.add_scalar('accuracy/train', train_accuracy, epoch)
+    writer.add_scalar('accuracy/val', val_metrics['accuracy'], epoch)
+    for metric_name, value in val_metrics.items():
+        if metric_name == 'val_loss':
+            continue  # already logged under loss/val
+        writer.add_scalar(f'metric/{metric_name}', value, epoch)
+
+
+def log_run_end_tb(writer, model, dataloader, model_type, model_name,
+                    best_metrics, run_idx, model_path, n_runs=N_RUNS):
+    """Log embeddings and hyperparameters at the end of a training run.
+
+    Args:
+        writer: SummaryWriter for this run
+        model: The trained model (will be loaded with best checkpoint for embeddings)
+        dataloader: Validation DataLoader
+        model_type: Model type string for evaluate_model / collect_learned_embeddings
+        model_name: Human-readable name used in tags and hparams
+        best_metrics: Dict of best metrics from this run
+        run_idx: Current run index (0-based)
+        model_path: Path to the saved best checkpoint (.pth)
+        n_runs: Total number of runs (used to determine when to log embeddings)
+    """
+    # Log embeddings on last run only, using best model checkpoint
+    if run_idx == n_runs - 1:
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        embs, lbls = collect_learned_embeddings(model, dataloader, model_type)
+        writer.add_embedding(embs, metadata=lbls.tolist(), tag=f'{model_name}_embeddings')
+
+    # Log hyperparameters with best metrics (exclude val_loss)
+    hparam_metrics = {f'hparam/{k}': v for k, v in best_metrics.items() if k != 'val_loss'}
+    writer.add_hparams(
+        {'lr': LR, 'epochs': EPOCHS, 'batch_size': BATCHSIZE, 'seed': SEED,
+         'dna_emb_dim': DNA_EMB_DIM, 'prot_emb_dim': PROT_EMB_DIM,
+         'model': model_name, 'run': run_idx},
+        hparam_metrics,
+        run_name='.'
+    )
+    writer.close()
+
 
 # ==============================================================================
 # Train model on protein embeddings only
@@ -325,7 +427,8 @@ print("\n" + "="*60)
 print("Training: Protein only baseline")
 print("="*60)
 
-for n in range(3):
+for n in range(N_RUNS):
+    writer = SummaryWriter(f"{LOG_DIR}/protein_only_run{n}")
     model = torch.nn.Sequential(
         torch.nn.Linear(PROT_EMB_DIM, 2),
     )
@@ -359,6 +462,7 @@ for n in range(3):
 
         # Evaluate with all metrics
         metrics = evaluate_model(model, test_dataloader, model_type='protein_only')
+        log_epoch_tb(writer, epoch, train_loss, train_accuracy, metrics)
         
         if metrics['roc_auc'] > best_roc_auc:
             best_roc_auc = metrics['roc_auc']
@@ -368,10 +472,12 @@ for n in range(3):
             print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
                   f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
+    log_run_end_tb(writer, model, test_dataloader, 'protein_only', 'protein_only',
+                    best_metrics, n, './results/protein_emb_model.pth')
     print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
           f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
-          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+          f"BAcc={best_metrics['balanced_accuracy']:.4f}, ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         results['Protein only'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
@@ -381,7 +487,8 @@ print("\n" + "="*60)
 print("Training: DNA only baseline")
 print("="*60)
 
-for n in range(3):
+for n in range(N_RUNS):
+    writer = SummaryWriter(f"{LOG_DIR}/dna_only_run{n}")
     model = torch.nn.Sequential(
         torch.nn.Linear(DNA_EMB_DIM, 2),
     )
@@ -415,6 +522,7 @@ for n in range(3):
 
         # Evaluate with all metrics
         metrics = evaluate_model(model, test_dataloader, model_type='dna_only')
+        log_epoch_tb(writer, epoch, train_loss, train_accuracy, metrics)
         
         if metrics['roc_auc'] > best_roc_auc:
             best_roc_auc = metrics['roc_auc']
@@ -424,10 +532,12 @@ for n in range(3):
             print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
                   f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
+    log_run_end_tb(writer, model, test_dataloader, 'dna_only', 'dna_only',
+                    best_metrics, n, './results/dna_emb_model.pth')
     print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
           f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
-          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+          f"BAcc={best_metrics['balanced_accuracy']:.4f}, ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         results['DNA only'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
@@ -437,7 +547,8 @@ print("\n" + "="*60)
 print("Training: Concatenation")
 print("="*60)
 
-for n in range(3):
+for n in range(N_RUNS):
+    writer = SummaryWriter(f"{LOG_DIR}/concatenation_run{n}")
     # DNA (768) + Protein (320) = 1088
     model = torch.nn.Sequential(
         torch.nn.Linear(DNA_EMB_DIM + PROT_EMB_DIM, 2),
@@ -473,6 +584,7 @@ for n in range(3):
 
         # Evaluate with all metrics
         metrics = evaluate_model(model, test_dataloader, model_type='concat')
+        log_epoch_tb(writer, epoch, train_loss, train_accuracy, metrics)
         
         if metrics['roc_auc'] > best_roc_auc:
             best_roc_auc = metrics['roc_auc']
@@ -482,10 +594,12 @@ for n in range(3):
             print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
                   f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
+    log_run_end_tb(writer, model, test_dataloader, 'concat', 'concatenation',
+                    best_metrics, n, './results/concat_model.pth')
     print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
           f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
-          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+          f"BAcc={best_metrics['balanced_accuracy']:.4f}, ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         results['Concatenation'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
@@ -523,7 +637,8 @@ class CLModel(nn.Module):
         return dna, prot
 
 
-for n in range(3):
+for n in range(N_RUNS):
+    writer = SummaryWriter(f"{LOG_DIR}/contrastive_run{n}")
     model = CLModel()
     model = model.to(device)
     optim = torch.optim.Adam(model.parameters(), lr=LR)
@@ -559,6 +674,7 @@ for n in range(3):
 
         # Evaluate with all metrics
         metrics = evaluate_model(model, test_dataloader, model_type='contrastive')
+        log_epoch_tb(writer, epoch, train_loss, train_accuracy, metrics)
         
         if metrics['roc_auc'] > best_roc_auc:
             best_roc_auc = metrics['roc_auc']
@@ -568,10 +684,12 @@ for n in range(3):
             print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
                   f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
+    log_run_end_tb(writer, model, test_dataloader, 'contrastive', 'contrastive',
+                    best_metrics, n, './results/contrastive_model.pth')
     print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
           f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
-          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+          f"BAcc={best_metrics['balanced_accuracy']:.4f}, ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         results['Contrastive'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
@@ -659,7 +777,8 @@ class AttentionModel(nn.Module):
         return self.prediction_head(output), output
 
 
-for n in range(3):
+for n in range(N_RUNS):
+    writer = SummaryWriter(f"{LOG_DIR}/attention_run{n}")
     model = AttentionModel(dna_lm, prot_lm, dna_tokenizer, prot_tokenizer)
     model = model.to(device)
     optim = torch.optim.Adam(model.parameters(), lr=LR)
@@ -691,6 +810,7 @@ for n in range(3):
 
         # Evaluate with all metrics
         metrics = evaluate_model(model, test_dataloader, model_type='attention')
+        log_epoch_tb(writer, epoch, train_loss, train_accuracy, metrics)
         
         if metrics['roc_auc'] > best_roc_auc:
             best_roc_auc = metrics['roc_auc']
@@ -700,10 +820,12 @@ for n in range(3):
             print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
                   f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
     
+    log_run_end_tb(writer, model, test_dataloader, 'attention', 'attention',
+                    best_metrics, n, './results/attention_model.pth')
     print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
           f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
-          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+          f"BAcc={best_metrics['balanced_accuracy']:.4f}, ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         results['Attention'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
@@ -808,7 +930,8 @@ class CompositionModel(nn.Module):
         return self.prediction_head(prot), prot
 
 
-for n in range(3):
+for n in range(N_RUNS):
+    writer = SummaryWriter(f"{LOG_DIR}/composition_run{n}")
     model = CompositionModel(dna_lm, prot_lm, dna_tokenizer, prot_tokenizer)
     model = model.to(device)
     optim = torch.optim.Adam(model.parameters(), lr=LR)
@@ -840,6 +963,7 @@ for n in range(3):
 
         # Evaluate with all metrics
         metrics = evaluate_model(model, test_dataloader, model_type='composition')
+        log_epoch_tb(writer, epoch, train_loss, train_accuracy, metrics)
         
         if metrics['roc_auc'] > best_roc_auc:
             best_roc_auc = metrics['roc_auc']
@@ -849,10 +973,12 @@ for n in range(3):
             print(f"Epoch {epoch + 1}, Train Acc: {train_accuracy:.4f}, "
                   f"Test Acc: {metrics['accuracy']:.4f}, ROC-AUC: {metrics['roc_auc']:.4f}")
 
+    log_run_end_tb(writer, model, test_dataloader, 'composition', 'composition',
+                    best_metrics, n, './results/comp_model.pth')
     print(f"Run {n+1}: Acc={best_metrics['accuracy']:.4f}, Prec={best_metrics['precision']:.4f}, "
           f"Rec={best_metrics['recall']:.4f}, MCC={best_metrics['mcc']:.4f}, F1={best_metrics['f1']:.4f}, "
-          f"ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+          f"BAcc={best_metrics['balanced_accuracy']:.4f}, ROC-AUC={best_metrics['roc_auc']:.4f}, PR-AUC={best_metrics['pr_auc']:.4f}")
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         results['Composition'][metric_name].append(best_metrics[metric_name])
 
 # ==============================================================================
@@ -866,11 +992,10 @@ for model_name, metrics_dict in results.items():
         row = {
             'Model': model_name,
             'Metric': metric_name,
-            'Run 1': values[0] if len(values) > 0 else None,
-            'Run 2': values[1] if len(values) > 1 else None,
-            'Run 3': values[2] if len(values) > 2 else None,
         }
-        if len(values) >= 3:
+        for i, v in enumerate(values):
+            row[f'Run {i+1}'] = v
+        if len(values) >= 2:
             row['Mean'] = np.mean(values)
             row['Std'] = np.std(values)
         rows.append(row)
@@ -894,10 +1019,12 @@ print("="*60)
 summary_rows = []
 for model_name in results.keys():
     row = {'Model': model_name}
-    for metric_name in ['accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
+    for metric_name in ['accuracy', 'balanced_accuracy', 'precision', 'recall', 'mcc', 'f1', 'roc_auc', 'pr_auc']:
         values = results[model_name][metric_name]
-        if len(values) >= 3:
+        if len(values) >= 2:
             row[metric_name] = f"{np.mean(values):.4f} ± {np.std(values):.4f}"
+        elif len(values) == 1:
+            row[metric_name] = f"{values[0]:.4f}"
         else:
             row[metric_name] = "N/A"
     summary_rows.append(row)

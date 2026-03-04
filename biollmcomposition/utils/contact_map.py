@@ -1,0 +1,208 @@
+"""Shared utilities for protein-DNA contact-map prediction training."""
+
+import random
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset
+from sklearn.metrics import (
+    average_precision_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    f1_score,
+)
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ---------------------------------------------------------------------------
+# Mask helpers
+# ---------------------------------------------------------------------------
+
+def mask_special_tokens(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Zero out position 0 (BOS/CLS) and the last non-pad position (EOS/SEP).
+
+    Works for both 1-D ``(L,)`` and 2-D ``(N, L)`` attention masks.
+    Returns a **new** tensor (no in-place modification).
+    """
+    mask = attention_mask.clone()
+    squeezed = mask.dim() == 1
+    if squeezed:
+        mask = mask.unsqueeze(0)
+    # Remove BOS / CLS at index 0
+    mask[:, 0] = 0
+    # Remove EOS / SEP = last non-pad position
+    orig = attention_mask if attention_mask.dim() == 2 else attention_mask.unsqueeze(0)
+    last_idx = orig.sum(dim=1).long() - 1  # (N,)
+    rows = torch.arange(mask.size(0), device=mask.device)
+    mask[rows, last_idx.clamp(min=0)] = 0
+    return mask.squeeze(0) if squeezed else mask
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+
+def masked_bce_loss(logits, targets, prot_mask, dna_mask):
+    """Masked BCE-with-logits loss over contact-map logits.
+
+    Parameters
+    ----------
+    logits    : (B, 2, R, L)
+    targets   : (B, 2, R, L)
+    prot_mask : (B, R)   — 1 at valid protein positions
+    dna_mask  : (B, 2, L) — 1 at valid DNA positions per strand
+
+    Returns
+    -------
+    Scalar loss averaged over valid entries.
+    """
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none",
+    )
+    mask = prot_mask[:, None, :, None].float() * dna_mask[:, :, None, :].float()
+    return (bce * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+def flatten_valid(logits, targets, prot_mask, dna_mask):
+    """Flatten logits / targets at valid mask positions to 1-D numpy arrays.
+
+    Returns ``(y_true_1d, y_score_1d)`` as float32 numpy arrays.
+    NaN scores are replaced with 0.0.
+    """
+    mask = (
+        prot_mask[:, None, :, None].float() * dna_mask[:, :, None, :].float()
+    ).bool()
+    scores = torch.sigmoid(logits)[mask].detach().cpu().numpy()
+    labels = targets[mask].detach().cpu().numpy()
+    return labels.astype(np.float32), scores.astype(np.float32)
+
+
+def compute_contactmap_metrics(y_true_1d, y_score_1d, thresh=0.5,
+                               n_positives_for_topL=None):
+    """Compute metrics for contact-map predictions.
+
+    Parameters
+    ----------
+    y_true_1d  : 1-D numpy array of ground-truth binary labels.
+    y_score_1d : 1-D numpy array of predicted scores in [0, 1].
+    thresh     : Decision threshold for P/R/F1/MCC.
+    n_positives_for_topL : int or None
+        If given, compute top-L precision using this as L (typically the
+        number of true contacts or the protein length).  If None, L is set
+        to the number of positives in y_true.
+
+    Returns
+    -------
+    dict with keys: ``pr_auc``, ``roc_auc``, ``mcc``,
+    ``precision``, ``recall``, ``f1``, ``top_L_precision``.
+    """
+    y_int = y_true_1d.astype(int)
+    y_pred = (y_score_1d >= thresh).astype(int)
+    both_classes = len(np.unique(y_int)) > 1
+
+    pr_auc = average_precision_score(y_int, y_score_1d) if both_classes else 0.0
+    roc_auc = roc_auc_score(y_int, y_score_1d) if both_classes else 0.0
+    mcc = matthews_corrcoef(y_int, y_pred)
+
+    L = n_positives_for_topL if n_positives_for_topL else int(y_int.sum())
+    if L > 0 and len(y_score_1d) > 0:
+        top_idx = np.argsort(y_score_1d)[-L:]
+        top_L_prec = y_int[top_idx].sum() / L
+    else:
+        top_L_prec = 0.0
+
+    return {
+        "pr_auc": pr_auc,
+        "roc_auc": roc_auc,
+        "mcc": mcc,
+        "precision": precision_score(y_int, y_pred, zero_division=0),
+        "recall": recall_score(y_int, y_pred, zero_division=0),
+        "f1": f1_score(y_int, y_pred, zero_division=0),
+        "top_L_precision": float(top_L_prec),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class ContactMapDataset(Dataset):
+    """PyTorch dataset that builds padded Y / masks on the fly.
+
+    Raw contact maps are stored as compact int8 arrays (variable size per
+    sample).  Each ``__getitem__`` call pads the map into a dense
+    ``(2, R, L)`` float32 tensor, which keeps total memory proportional to
+    the actual data rather than ``N * 2 * R * L``.
+
+    Expects ``split_data`` dict produced by
+    ``scripts/00_precompute_tokens_and_labels.py``.
+    """
+
+    def __init__(self, split_data: dict):
+        self.dna1_ids = split_data["dna1"]["input_ids"]
+        self.dna1_am = split_data["dna1"]["attention_mask"]
+        self.dna2_ids = split_data["dna2"]["input_ids"]
+        self.dna2_am = split_data["dna2"]["attention_mask"]
+        self.prot_ids = split_data["prot"]["input_ids"]
+        self.prot_am = split_data["prot"]["attention_mask"]
+        self.contact_maps = split_data["contact_maps"]
+        self.R = self.prot_ids.size(1)   # max_prot_len (token dim)
+        self.L = self.dna1_ids.size(1)   # max_dna_len  (token dim)
+
+    def __len__(self):
+        return len(self.contact_maps)
+
+    def __getitem__(self, idx):
+        R, L = self.R, self.L
+
+        # ── build padded Y (2, R, L) from raw contact maps ──
+        Y = torch.zeros(2, R, L)
+        cm = self.contact_maps[idx]
+        cm1 = cm["cm1"]
+        rend = min(1 + cm1.shape[0], R)
+        lend1 = min(1 + cm1.shape[1], L)
+        Y[0, 1:rend, 1:lend1] = torch.from_numpy(
+            cm1[: rend - 1, : lend1 - 1].astype(np.float32),
+        )
+        cm2 = cm["cm2"]
+        if cm2 is not None:
+            lend2 = min(1 + cm2.shape[1], L)
+            Y[1, 1:rend, 1:lend2] = torch.from_numpy(
+                cm2[: rend - 1, : lend2 - 1].astype(np.float32),
+            )
+
+        # ── masks (derived from attention_mask, special tokens removed) ──
+        prot_mask = mask_special_tokens(self.prot_am[idx])
+        dna_mask = torch.stack([
+            mask_special_tokens(self.dna1_am[idx]),
+            mask_special_tokens(self.dna2_am[idx]),
+        ])
+
+        return {
+            "dna1_input_ids": self.dna1_ids[idx],
+            "dna1_attention_mask": self.dna1_am[idx],
+            "dna2_input_ids": self.dna2_ids[idx],
+            "dna2_attention_mask": self.dna2_am[idx],
+            "prot_input_ids": self.prot_ids[idx],
+            "prot_attention_mask": self.prot_am[idx],
+            "Y": Y,
+            "dna_mask": dna_mask,
+            "prot_mask": prot_mask,
+        }

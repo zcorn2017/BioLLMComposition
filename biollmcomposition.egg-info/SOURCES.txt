@@ -2,9 +2,10 @@ README.md
 pyproject.toml
 biollmcomposition/__init__.py
 biollmcomposition/config.py
-biollmcomposition/utils.py
 biollmcomposition.egg-info/PKG-INFO
 biollmcomposition.egg-info/SOURCES.txt
 biollmcomposition.egg-info/dependency_links.txt
 biollmcomposition.egg-info/requires.txt
 biollmcomposition.egg-info/top_level.txt
+biollmcomposition/utils/__init__.py
+biollmcomposition/utils/contact_map.py
