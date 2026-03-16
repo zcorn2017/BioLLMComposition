@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Train cross-attention contact-map model for protein–DNA binding.
+"""Standalone training script for the attention contact-map model.
 
-Usage
------
-    python scripts/frameworks/attention_contactmap.py \
-        --config scripts/configs/attention_contactmap.yaml
-
-    # Override any config value via CLI:
-    python scripts/frameworks/attention_contactmap.py \
-        --config scripts/configs/attention_contactmap.yaml \
-        --lr 1e-4 --batch_size 8
+For the unified config-driven entry point, prefer:
+    python scripts/02_run_training.py --config configs/training/attention_contactmap.yaml
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime
@@ -19,48 +14,32 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from transformers import AutoModel, AutoModelForMaskedLM, BertConfig
 
-from biollmcomposition.utils.contact_map import (
-    set_seed,
-    masked_bce_loss,
-    flatten_valid,
-    compute_contactmap_metrics,
-    ContactMapDataset,
+from biollmcomposition.frameworks.attention import (
+    AttentionContactMapModel,
+    build_model,
 )
-
-
-# ── Config loading ────────────────────────────────────────────────────────
-
-def load_config(args):
-    """Merge YAML config with CLI overrides. CLI wins."""
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-
-    cli = vars(args)
-    for key in ["lr", "epochs", "batch_size", "num_workers", "n_runs",
-                "seed", "head_dim", "log_dir", "save_dir", "data_pt"]:
-        if cli.get(key) is not None:
-            if key in ("lr", "epochs", "batch_size", "num_workers",
-                       "n_runs", "seed", "head_dim"):
-                cfg.setdefault("training", {})[key] = cli[key]
-            elif key == "data_pt":
-                cfg.setdefault("data", {})["data_pt"] = cli[key]
-            elif key in ("log_dir", "save_dir"):
-                cfg.setdefault("output", {})[key] = cli[key]
-    return cfg
+from biollmcomposition.models import get_model_info, load_model
+from biollmcomposition.utils.contact_map import (
+    ContactMapDataset,
+    compute_contactmap_metrics,
+    flatten_valid,
+    masked_bce_loss,
+    load_split_and_resolve_data,
+    set_seed,
+    subset_data,
+)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", type=str, required=True,
-                   help="Path to YAML config file")
+    p.add_argument("--config", type=str, required=True)
     p.add_argument("--data_pt", type=str, default=None)
+    p.add_argument("--split_pt", type=str, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
@@ -73,85 +52,23 @@ def parse_args():
     return p.parse_args()
 
 
-# ── Model ─────────────────────────────────────────────────────────────────
+def load_config(args):
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    cli = vars(args)
+    for key in ("data_pt", "split_pt"):
+        if cli.get(key):
+            cfg.setdefault("data", {})[key] = cli[key]
+    for key in ("lr", "epochs", "batch_size", "num_workers", "n_runs", "seed"):
+        if cli.get(key) is not None:
+            cfg.setdefault("training", {})[key] = cli[key]
+    if cli.get("head_dim") is not None:
+        cfg.setdefault("architecture", {})["head_dim"] = cli["head_dim"]
+    for key in ("log_dir", "save_dir"):
+        if cli.get(key):
+            cfg.setdefault("output", {})[key] = cli[key]
+    return cfg
 
-class ContactMapHead(nn.Module):
-    def __init__(self, prot_dim: int, dna_dim: int, head_dim: int = 64):
-        super().__init__()
-        self.prot_proj = nn.Linear(prot_dim, head_dim)
-        self.dna_proj = nn.Linear(dna_dim, head_dim)
-
-    def forward(self, prot_h, dna_h):
-        return torch.bmm(
-            self.prot_proj(prot_h),
-            self.dna_proj(dna_h).transpose(1, 2),
-        )
-
-
-class AttentionContactMapModel(nn.Module):
-    """Cross-attention model predicting per-residue contact maps.
-
-    Protein (query) attends to each DNA strand (key/value) independently,
-    then a shared bilinear head produces ``(B, 2, R, L)`` logits.
-    """
-
-    def __init__(self, dna_lm, prot_lm, dna_emb_dim, prot_emb_dim,
-                 head_dim: int = 64):
-        super().__init__()
-        self.dna_lm = dna_lm
-        self.prot_lm = prot_lm
-
-        self.dna_proj = nn.Linear(dna_emb_dim, prot_emb_dim)
-        self.attn = nn.MultiheadAttention(prot_emb_dim, num_heads=1,
-                                          batch_first=True)
-        self.post_attn_norm = nn.LayerNorm(prot_emb_dim)
-        self.contact_head = ContactMapHead(prot_emb_dim, prot_emb_dim,
-                                           head_dim)
-
-        for p in self.dna_lm.parameters():
-            p.requires_grad = False
-        for p in self.prot_lm.parameters():
-            p.requires_grad = False
-
-    def _dna_hidden(self, input_ids, attention_mask):
-        with torch.no_grad():
-            out = self.dna_lm(input_ids=input_ids,
-                              attention_mask=attention_mask)
-        h = out[0] if isinstance(out, tuple) else out.last_hidden_state
-        return self.dna_proj(h)
-
-    def _prot_hidden(self, input_ids, attention_mask):
-        with torch.no_grad():
-            out = self.prot_lm(input_ids, attention_mask=attention_mask,
-                               output_hidden_states=True)
-        return out.hidden_states[-1]
-
-    def _cross_attn_strand(self, prot_h, dna_h, dna_am):
-        out, _ = self.attn(
-            query=prot_h, key=dna_h, value=dna_h,
-            key_padding_mask=~dna_am.bool(),
-        )
-        return self.post_attn_norm(out) + prot_h
-
-    def forward(self, batch):
-        prot_h = self._prot_hidden(batch["prot_input_ids"],
-                                   batch["prot_attention_mask"])
-        dna1_h = self._dna_hidden(batch["dna1_input_ids"],
-                                  batch["dna1_attention_mask"])
-        dna2_h = self._dna_hidden(batch["dna2_input_ids"],
-                                  batch["dna2_attention_mask"])
-
-        ctx1 = self._cross_attn_strand(prot_h, dna1_h,
-                                       batch["dna1_attention_mask"])
-        ctx2 = self._cross_attn_strand(prot_h, dna2_h,
-                                       batch["dna2_attention_mask"])
-
-        cm1 = self.contact_head(ctx1, dna1_h)
-        cm2 = self.contact_head(ctx2, dna2_h)
-        return torch.stack([cm1, cm2], dim=1)
-
-
-# ── Training / eval loops ─────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
@@ -194,102 +111,87 @@ def evaluate(model, loader, device):
     return metrics
 
 
-# ── Main ──────────────────────────────────────────────────────────────────
-
 def main():
     args = parse_args()
     cfg = load_config(args)
 
-    m = cfg["models"]
-    t = cfg["training"]
-    a = cfg["architecture"]
-    o = cfg["output"]
+    t = cfg.get("training", {})
+    a = cfg.get("architecture", {})
+    o = cfg.get("output", {})
 
-    set_seed(t["seed"])
+    set_seed(t.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Config: {cfg}")
 
-    dna_short = m["dna"]["short"]
-    prot_short = m["protein"]["short"]
-    dna_emb_dim = m["dna"]["emb_dim"]
-    prot_emb_dim = m["protein"]["emb_dim"]
+    data, data_spec, split, split_spec = load_split_and_resolve_data(cfg)
 
-    # ── data ──
-    data = torch.load(cfg["data"]["data_pt"], map_location="cpu",
-                      weights_only=False)
-    spec = data["spec"]
-    print(f"Spec: {spec}")
+    dna_short = data_spec["dna_model_short"]
+    prot_short = data_spec["prot_model_short"]
+    dna_info = get_model_info(dna_short)
+    prot_info = get_model_info(prot_short)
 
-    nw = t["num_workers"]
+    train_data = subset_data(data, split["train_idx"])
+    val_data = subset_data(data, split["val_idx"])
+
+    nw = t.get("num_workers", 4)
+    bs = t.get("batch_size", 16)
     train_loader = DataLoader(
-        ContactMapDataset(data["train"]),
-        batch_size=t["batch_size"], shuffle=True,
+        ContactMapDataset(train_data), batch_size=bs, shuffle=True,
         num_workers=nw, pin_memory=(device.type == "cuda"),
         persistent_workers=(nw > 0),
     )
     val_loader = DataLoader(
-        ContactMapDataset(data["val"]),
-        batch_size=t["batch_size"],
+        ContactMapDataset(val_data), batch_size=bs,
         num_workers=nw, pin_memory=(device.type == "cuda"),
         persistent_workers=(nw > 0),
     )
 
-    # ── LMs (frozen) ──
-    print(f"Loading DNA model: {m['dna']['name']}")
-    dna_config = BertConfig.from_pretrained(m["dna"]["name"])
-    dna_lm = (AutoModel
-              .from_pretrained(m["dna"]["name"], trust_remote_code=True,
-                               config=dna_config)
-              .to(device).eval())
-    print(f"Loading Protein model: {m['protein']['name']}")
-    prot_lm = (AutoModelForMaskedLM
-               .from_pretrained(m["protein"]["name"])
-               .to(device).eval())
+    print(f"Loading DNA model: {dna_info['hf_name']}")
+    dna_lm = load_model(dna_short, device=str(device))
+    print(f"Loading Protein model: {prot_info['hf_name']}")
+    prot_lm = load_model(prot_short, device=str(device))
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = Path(o["save_dir"])
+    save_dir = Path(o.get("save_dir", "./results"))
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    run_tag = (f"attn_cm_{dna_short}_{prot_short}"
-               f"_lr{t['lr']}_bs{t['batch_size']}_hd{a['head_dim']}"
+    split_tag = split_spec.get("strategy", "unk").replace("_", "")
+    run_tag = (f"attn_cm_{dna_short}_{prot_short}_{split_tag}"
+               f"_lr{t.get('lr', 5e-5)}_bs{bs}_hd{a.get('head_dim', 64)}"
                f"_{ts}")
 
-    # ── runs ──
-    for run in range(t["n_runs"]):
+    for run in range(t.get("n_runs", 1)):
         print(f"\n{'=' * 60}")
-        print(f"Run {run + 1}/{t['n_runs']}  [{run_tag}]")
+        print(f"Run {run + 1}/{t.get('n_runs', 1)}  [{run_tag}]")
         print("=" * 60)
 
-        writer = SummaryWriter(f"{o['log_dir']}/{run_tag}/run{run}")
+        writer = SummaryWriter(f"{o.get('log_dir', './runs')}/{run_tag}/run{run}")
         writer.add_text("config", str(cfg))
+        writer.add_text("data_spec", str(data_spec))
+        writer.add_text("split_spec", str(split_spec))
         writer.add_text("base_models",
-                        f"DNA: {m['dna']['name']}\nProtein: {m['protein']['name']}")
+                        f"DNA: {dna_info['hf_name']} ({dna_short})\n"
+                        f"Protein: {prot_info['hf_name']} ({prot_short})")
 
-        model = AttentionContactMapModel(
-            dna_lm, prot_lm,
-            dna_emb_dim=dna_emb_dim, prot_emb_dim=prot_emb_dim,
-            head_dim=a["head_dim"],
-        ).to(device)
+        model = build_model(dna_lm, prot_lm, dna_info, prot_info, a,
+                            device=str(device))
         optimizer = torch.optim.Adam(
-            [p for p in model.parameters() if p.requires_grad], lr=t["lr"],
+            [p for p in model.parameters() if p.requires_grad],
+            lr=t.get("lr", 5e-5),
         )
 
         best_pr_auc = -1.0
-        best_metrics = {}
-        ckpt_path = save_dir / f"{run_tag}_best.pth"
+        best_metrics: dict = {}
+        ckpt_path = save_dir / f"{run_tag}_run{run}_best.pth"
 
-        for epoch in tqdm(range(t["epochs"]), desc=f"Run {run}"):
-            train_loss = train_one_epoch(model, train_loader, optimizer,
-                                         device)
+        for epoch in tqdm(range(t.get("epochs", 100)), desc=f"Run {run}"):
+            train_loss = train_one_epoch(model, train_loader, optimizer, device)
             metrics = evaluate(model, val_loader, device)
-
             writer.add_scalar("loss/train", train_loss, epoch)
             writer.add_scalar("loss/val", metrics["val_loss"], epoch)
             for k, v in metrics.items():
                 if k != "val_loss":
                     writer.add_scalar(f"metric/{k}", v, epoch)
-
             if metrics["pr_auc"] > best_pr_auc:
                 best_pr_auc = metrics["pr_auc"]
                 best_metrics = metrics

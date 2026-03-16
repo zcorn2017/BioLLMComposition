@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "biollmcomposition"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["python-dotenv"]
+dependencies = ["python-dotenv", "pyyaml"]
 
 [tool.setuptools.packages.find]
 include = ["biollmcomposition*"]

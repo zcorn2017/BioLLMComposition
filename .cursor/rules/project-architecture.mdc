@@ -1,0 +1,204 @@
+---
+description: BioLLMComposition project architecture, data pipeline, model registry, frameworks, and loss functions for protein-DNA contact map prediction
+globs:
+alwaysApply: true
+---
+
+# BioLLMComposition — Project Architecture
+
+## Goal
+
+Predict **protein–DNA residue-level contact maps** by composing frozen
+protein LMs (ESM2/ESM-C) with frozen DNA LMs (DNABERT-2) through
+learnable cross-attention layers and a bilinear contact head.
+
+Output shape: `(B, 2, R, L)` — two DNA strands × protein residues × DNA nucleotides.
+
+## Repository Layout
+
+```
+biollmcomposition/
+  models/              # Model registry (ESM2, ESM-C, DNABERT-2)
+    __init__.py         # Unified get_model_info / load_model / load_tokenizer
+    esm2.py             # ESM2 variants (8M→15B), dims, layer counts
+    esmc.py             # ESM-C variants (300M, 600M)
+    dnabert2.py         # DNABERT-2 (117M), emb_dim=768
+  frameworks/           # Composition strategies
+    __init__.py          # get_framework() dispatcher
+    attention.py         # Cross-attention: prot queries each DNA strand separately
+    composition.py       # LM-interleaved: DNA injected into ESM2 layers via cross-attn
+  utils/
+    contact_map.py       # Losses, metrics, dataset, masks, splitting helpers
+
+scripts/
+  00_precompute_tokens_and_labels.py   # Raw data → tokenized .pt
+  01_split_datasets.py                 # .pt → train/val/test split indices
+  02_run_training.py                   # Unified config-driven training (BCE loss)
+  frameworks/
+    attention_contactmap.py            # Standalone attention trainer (BCE)
+    composition_contactmap.py          # Standalone composition trainer (BCE)
+    attention_contactmap_focal_loss.py # Attention + focal loss + LR schedule
+    composition_contactmap_focal_loss.py # Composition + focal loss + LR schedule
+
+configs/
+  precompute/        # YAML for 00_precompute
+  splitting/         # YAML for 01_split
+  training/          # YAML for 02_run_training and standalone scripts
+```
+
+## Data Pipeline
+
+```
+Raw pickle (residue_wise.pkl)
+  → 00_precompute_tokens_and_labels.py  →  tokens_*.pt
+  → 01_split_datasets.py               →  split_*.pt  (indices only)
+  → 02_run_training.py or scripts/frameworks/*.py  (loads both files)
+```
+
+### Key data paths
+- Tokens: `/home/zcorn/Projects/proteinDNA_data/processed/embeddings/tokens_*.pt`
+- Splits: `/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_*.pt`
+
+### Token file structure
+```python
+{
+  "spec": {"dna_model_short", "prot_model_short", "max_dna_len", "max_prot_len", "n_samples", ...},
+  "dna1": {"input_ids": (N, L), "attention_mask": (N, L)},
+  "dna2": {"input_ids": (N, L), "attention_mask": (N, L)},
+  "prot": {"input_ids": (N, R), "attention_mask": (N, R)},
+  "contact_maps": [{"cm1": np.int8, "cm2": np.int8 | None}, ...],  # compact, variable-size
+  "meta": {"pdb_ids": [...], "cluster_ids": [...], ...},
+}
+```
+
+### Split file structure
+```python
+{
+  "spec": {"strategy", "group_col", "seed", "ratios", "n_train", "n_val", "n_test"},
+  "train_idx": [...], "val_idx": [...], "test_idx": [...],
+}
+```
+
+## Model Registry
+
+Short names → HF model IDs, emb_dim, layer count, family.
+
+```python
+from biollmcomposition.models import get_model_info, load_model, load_tokenizer
+info = get_model_info("esm2-3B")   # {"hf_name": "...", "emb_dim": 2560, "layers": 36, ...}
+model = load_model("esm2-3B", device="cuda")  # frozen, eval mode
+```
+
+**Families**: `esm2` (8M/35M/150M/650M/3B/15B), `esmc` (300M/600M), `dnabert2` (117M).
+
+## Frameworks
+
+### Attention (`biollmcomposition/frameworks/attention.py`)
+- Protein queries each DNA strand separately via cross-attention
+- Works with any protein LM family
+- Trainable: `dna_proj`, 1-head MHA, LayerNorm, bilinear head
+
+### Composition (`biollmcomposition/frameworks/composition.py`)
+- DNA context injected INTO ESM2 encoder layers at `target_layers`
+- **Requires ESM2-family** (accesses `prot_lm.esm.encoder.layer[i]`)
+- Trainable: `dna_proj`, per-layer MHA + LayerNorm, bilinear head
+- Config: `target_layers`, `num_heads`
+
+Both output `(B, 2, R, L)` logits via `ContactMapHead` (bilinear dot product).
+
+## Loss Functions (`biollmcomposition/utils/contact_map.py`)
+
+### `masked_bce_loss(logits, targets, prot_mask, dna_mask)`
+Standard BCE. Averages over valid (non-pad, non-special-token) positions.
+
+### `masked_focal_loss(logits, targets, prot_mask, dna_mask, alpha=0.95, gamma=2.0)`
+Focal loss for extreme class imbalance. Added because contact maps are
+~0.12% positive (~1 contact per 820 cells).
+
+- `alpha`: positive-class weight (0.95 default, high because positives are rare)
+- `gamma`: focusing exponent (2.0 default); down-weights easy negatives
+- Formula: `alpha_t * (1 - p_t)^gamma * BCE(logits, targets)`
+
+### Why focal loss was needed
+| Split | Positive % (raw) | Positive % (padded) |
+|-------|-------------------|---------------------|
+| Train | 0.12%             | 0.004%              |
+| Val   | 0.13%             | 0.004%              |
+
+With plain BCE, the gradient was dominated by negatives → model predicted
+"no contact" everywhere → F1 ~0.15, MCC ~0.2.
+
+## Focal Loss Training Scripts
+
+`scripts/frameworks/{attention,composition}_contactmap_focal_loss.py`
+
+Differences from BCE versions:
+1. Uses `masked_focal_loss` instead of `masked_bce_loss`
+2. Adds **linear warmup + cosine decay** LR scheduler (per-step, not per-epoch)
+3. Logs `lr` scalar to TensorBoard
+4. Config has `loss:` section (`focal_alpha`, `focal_gamma`) and `warmup_epochs`
+
+### LR Schedule
+```
+warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr_ratio=0.01)
+```
+- Linear ramp: 0 → base_lr over `warmup_epochs` (default 5)
+- Cosine decay: base_lr → 1% of base_lr over remaining epochs
+
+### Config structure (focal loss YAML)
+```yaml
+framework: "composition"  # or "attention"
+data:
+  data_pt: "/path/to/tokens_*.pt"
+  split_pt: "/path/to/split_*.pt"
+training:
+  lr: 5.0e-5
+  epochs: 200
+  batch_size: 16
+  num_workers: 4
+  seed: 42
+  warmup_epochs: 5
+loss:
+  focal_alpha: 0.95
+  focal_gamma: 2.0
+architecture:
+  head_dim: 64
+  num_heads: 20              # composition only
+  target_layers: [0, 3, 5]   # composition only, must be < prot model layers
+output:
+  log_dir: "./runs"
+  save_dir: "./results"
+```
+
+### Running
+```bash
+# Focal loss + scheduler
+python scripts/frameworks/composition_contactmap_focal_loss.py \
+    --config configs/training/composition_contactmap_focal_loss.yaml
+
+python scripts/frameworks/attention_contactmap_focal_loss.py \
+    --config configs/training/attention_contactmap_focal_loss.yaml
+
+# Override from CLI
+python scripts/frameworks/composition_contactmap_focal_loss.py \
+    --config configs/training/composition_contactmap_focal_loss.yaml \
+    --focal_alpha 0.9 --focal_gamma 3.0 --warmup_epochs 10 --lr 1e-4
+
+# Original BCE (no focal loss, no scheduler)
+python scripts/02_run_training.py \
+    --config configs/training/composition_contactmap.yaml
+```
+
+## Evaluation Metrics
+
+`compute_contactmap_metrics()` returns: `pr_auc`, `roc_auc`, `mcc`,
+`precision`, `recall`, `f1`, `top_L_precision`. Default threshold = 0.5.
+Best model selected by `pr_auc`. All metrics logged to TensorBoard.
+
+## Key Design Decisions
+
+- **LMs are always frozen** — only cross-attention + contact head are trained
+- **Model info comes from the data .pt file** (not training config) to prevent mismatches
+- **Contact maps stored compact** (variable-size int8); padded on-the-fly in Dataset
+- **Special tokens masked** via `mask_special_tokens()` — BOS/CLS at idx 0 and EOS/SEP removed
+- **GroupShuffleSplit** by `pdb_id` or `cluster_id` prevents data leakage

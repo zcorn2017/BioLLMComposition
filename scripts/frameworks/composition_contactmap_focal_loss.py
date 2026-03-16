@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Standalone training script for the composition contact-map model.
+"""Train composition contact-map model with focal loss and LR scheduling.
 
-For the unified config-driven entry point, prefer:
-    python scripts/02_run_training.py --config configs/training/composition_contactmap.yaml
+Replaces plain BCE with focal loss to handle extreme class imbalance
+(~0.12% positives), and adds cosine-annealing LR with linear warmup.
+
+Usage
+-----
+    python scripts/frameworks/composition_contactmap_focal_loss.py \
+        --config configs/training/composition_contactmap_focal_loss.yaml
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime
+import math
 from pathlib import Path
 
 import numpy as np
 import torch
 import yaml
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -27,7 +34,7 @@ from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
     flatten_valid,
-    masked_bce_loss,
+    masked_focal_loss,
     load_split_and_resolve_data,
     set_seed,
     subset_data,
@@ -48,6 +55,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--head_dim", type=int, default=None)
     p.add_argument("--num_heads", type=int, default=None)
+    p.add_argument("--focal_alpha", type=float, default=None)
+    p.add_argument("--focal_gamma", type=float, default=None)
+    p.add_argument("--warmup_epochs", type=int, default=None)
     p.add_argument("--log_dir", type=str, default=None)
     p.add_argument("--save_dir", type=str, default=None)
     return p.parse_args()
@@ -60,36 +70,61 @@ def load_config(args):
     for key in ("data_pt", "split_pt"):
         if cli.get(key):
             cfg.setdefault("data", {})[key] = cli[key]
-    for key in ("lr", "epochs", "batch_size", "num_workers", "n_runs", "seed"):
+    for key in ("lr", "epochs", "batch_size", "num_workers", "n_runs", "seed",
+                "warmup_epochs"):
         if cli.get(key) is not None:
             cfg.setdefault("training", {})[key] = cli[key]
     for key in ("head_dim", "num_heads"):
         if cli.get(key) is not None:
             cfg.setdefault("architecture", {})[key] = cli[key]
+    for key in ("focal_alpha", "focal_gamma"):
+        if cli.get(key) is not None:
+            cfg.setdefault("loss", {})[key] = cli[key]
     for key in ("log_dir", "save_dir"):
         if cli.get(key):
             cfg.setdefault("output", {})[key] = cli[key]
     return cfg
 
 
-def train_one_epoch(model, loader, optimizer, device):
+# ── LR schedule: linear warmup → cosine decay ────────────────────────────
+
+def warmup_cosine_schedule(optimizer, warmup_steps: int, total_steps: int,
+                           min_lr_ratio: float = 0.01):
+    """Linear warmup for ``warmup_steps``, then cosine decay to
+    ``min_lr_ratio * base_lr`` over the remaining steps."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (
+            1.0 + math.cos(math.pi * progress)
+        )
+    return LambdaLR(optimizer, lr_lambda)
+
+
+# ── Training / eval ──────────────────────────────────────────────────────
+
+def train_one_epoch(model, loader, optimizer, scheduler, device,
+                    focal_alpha: float, focal_gamma: float):
     model.train()
     total_loss, n = 0.0, 0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         logits = model(batch)
-        loss = masked_bce_loss(logits, batch["Y"],
-                               batch["prot_mask"], batch["dna_mask"])
+        loss = masked_focal_loss(logits, batch["Y"],
+                                 batch["prot_mask"], batch["dna_mask"],
+                                 alpha=focal_alpha, gamma=focal_gamma)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
         total_loss += loss.item() * batch["Y"].size(0)
         n += batch["Y"].size(0)
     return total_loss / max(n, 1)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, focal_alpha: float, focal_gamma: float):
     model.eval()
     all_true, all_score = [], []
     total_loss, n = 0.0, 0
@@ -97,8 +132,9 @@ def evaluate(model, loader, device):
         batch = {k: v.to(device) for k, v in batch.items()}
         logits = model(batch)
         total_loss += (
-            masked_bce_loss(logits, batch["Y"],
-                            batch["prot_mask"], batch["dna_mask"]).item()
+            masked_focal_loss(logits, batch["Y"],
+                              batch["prot_mask"], batch["dna_mask"],
+                              alpha=focal_alpha, gamma=focal_gamma).item()
             * batch["Y"].size(0)
         )
         n += batch["Y"].size(0)
@@ -113,6 +149,8 @@ def evaluate(model, loader, device):
     return metrics
 
 
+# ── Main ──────────────────────────────────────────────────────────────────
+
 def main():
     args = parse_args()
     cfg = load_config(args)
@@ -120,6 +158,10 @@ def main():
     t = cfg.get("training", {})
     a = cfg.get("architecture", {})
     o = cfg.get("output", {})
+    loss_cfg = cfg.get("loss", {})
+
+    focal_alpha = loss_cfg.get("focal_alpha", 0.95)
+    focal_gamma = loss_cfg.get("focal_gamma", 2.0)
 
     set_seed(t.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,13 +199,24 @@ def main():
     save_dir = Path(o.get("save_dir", "./results"))
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    epochs = t.get("epochs", 100)
+    warmup_epochs = t.get("warmup_epochs", 5)
+    steps_per_epoch = len(train_loader)
+    total_steps = epochs * steps_per_epoch
+    warmup_steps = warmup_epochs * steps_per_epoch
+
     split_tag = split_spec.get("strategy", "unk").replace("_", "")
     tl = a.get("target_layers", [0, 3, 5])
-    run_tag = (f"comp_cm_{dna_short}_{prot_short}_{split_tag}"
+    run_tag = (f"comp_cm_fl_{dna_short}_{prot_short}_{split_tag}"
                f"_lr{t.get('lr', 5e-5)}_bs{bs}_hd{a.get('head_dim', 64)}"
                f"_nh{a.get('num_heads', 20)}"
                f"_tl{''.join(str(x) for x in tl)}"
+               f"_a{focal_alpha}_g{focal_gamma}"
                f"_{ts}")
+
+    print(f"Focal loss: alpha={focal_alpha}, gamma={focal_gamma}")
+    print(f"LR schedule: warmup={warmup_epochs} epochs ({warmup_steps} steps), "
+          f"total={epochs} epochs ({total_steps} steps)")
 
     for run in range(t.get("n_runs", 1)):
         print(f"\n{'=' * 60}")
@@ -177,6 +230,8 @@ def main():
         writer.add_text("base_models",
                         f"DNA: {dna_info['hf_name']} ({dna_short})\n"
                         f"Protein: {prot_info['hf_name']} ({prot_short})")
+        writer.add_text("loss",
+                        f"Focal loss: alpha={focal_alpha}, gamma={focal_gamma}")
 
         model = build_model(dna_lm, prot_lm, dna_info, prot_info, a,
                             device=str(device))
@@ -184,16 +239,23 @@ def main():
             [p for p in model.parameters() if p.requires_grad],
             lr=t.get("lr", 5e-5),
         )
+        scheduler = warmup_cosine_schedule(optimizer, warmup_steps, total_steps)
 
         best_pr_auc = -1.0
         best_metrics: dict = {}
         ckpt_path = save_dir / f"{run_tag}_run{run}_best.pth"
 
-        for epoch in tqdm(range(t.get("epochs", 100)), desc=f"Run {run}"):
-            train_loss = train_one_epoch(model, train_loader, optimizer, device)
-            metrics = evaluate(model, val_loader, device)
+        for epoch in tqdm(range(epochs), desc=f"Run {run}"):
+            train_loss = train_one_epoch(model, train_loader, optimizer,
+                                         scheduler, device,
+                                         focal_alpha, focal_gamma)
+            metrics = evaluate(model, val_loader, device,
+                               focal_alpha, focal_gamma)
+
+            cur_lr = optimizer.param_groups[0]["lr"]
             writer.add_scalar("loss/train", train_loss, epoch)
             writer.add_scalar("loss/val", metrics["val_loss"], epoch)
+            writer.add_scalar("lr", cur_lr, epoch)
             for k, v in metrics.items():
                 if k != "val_loss":
                     writer.add_scalar(f"metric/{k}", v, epoch)

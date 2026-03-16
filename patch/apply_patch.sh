@@ -1,68 +1,57 @@
 #!/bin/bash
-# Script to apply the DNABERT-2 Triton compatibility patch
+# Fix DNABERT-2's flash_attn_triton.py for Triton 3.x compatibility.
+#
+# Triton 3.x removed the `trans_b` kwarg from `tl.dot()`.
+# This script replaces every occurrence with `tl.trans()`.
 
 set -e
 
 echo "=========================================="
-echo "DNABERT-2 Triton Compatibility Patch"
+echo "DNABERT-2 Triton Compatibility Fix"
 echo "=========================================="
 echo
 
-# Find the flash_attn_triton.py file
 CACHE_DIR="$HOME/.cache/huggingface/modules/transformers_modules"
-FILE=$(find "$CACHE_DIR" -path "*/zhihan1996/DNABERT*/**/flash_attn_triton.py" 2>/dev/null | head -1)
 
-if [ -z "$FILE" ]; then
-    # Try broader search
-    FILE=$(find "$CACHE_DIR" -name "flash_attn_triton.py" | grep -i dnabert | head -1)
-fi
+# Find ALL copies (HF cache may have both "DNABERT-2-117M" and "DNABERT_hyphen_2_hyphen_117M")
+mapfile -t FILES < <(find "$CACHE_DIR" -name "flash_attn_triton.py" 2>/dev/null | grep -i dnabert)
 
-if [ -z "$FILE" ]; then
-    echo "Error: Could not find flash_attn_triton.py"
+if [ ${#FILES[@]} -eq 0 ]; then
+    echo "Error: Could not find any flash_attn_triton.py for DNABERT-2"
     echo "Please ensure you have loaded the DNABERT-2 model at least once."
     exit 1
 fi
 
-echo "Found file: $FILE"
+echo "Found ${#FILES[@]} copy/copies:"
+printf "  %s\n" "${FILES[@]}"
 echo
 
-# Get the directory containing the file
-FILE_DIR=$(dirname "$FILE")
-PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dnabert_triton_fix.patch"
-
-if [ ! -f "$PATCH_FILE" ]; then
-    echo "Error: Patch file not found: $PATCH_FILE"
-    exit 1
-fi
-
-echo "Applying patch..."
-cd "$FILE_DIR"
-
-# Apply the patch
-if patch -p1 < "$PATCH_FILE"; then
-    echo "✓ Patch applied successfully!"
-else
-    echo "Error: Failed to apply patch"
-    echo "The file may have already been patched or has been modified."
-    exit 1
-fi
+TOTAL_FIXED=0
+for FILE in "${FILES[@]}"; do
+    COUNT=$(grep -c 'trans_b=True' "$FILE" 2>/dev/null || true)
+    if [ "$COUNT" -eq 0 ]; then
+        echo "  $FILE — already patched"
+        continue
+    fi
+    echo "  $FILE — fixing $COUNT occurrence(s)..."
+    sed -i 's/tl\.dot(\([^,]*\), \([^,]*\), trans_b=True)/tl.dot(\1, tl.trans(\2))/g' "$FILE"
+    REMAINING=$(grep -c 'trans_b=True' "$FILE" 2>/dev/null || true)
+    if [ "$REMAINING" -ne 0 ]; then
+        echo "    Warning: $REMAINING instance(s) remain:"
+        grep -n 'trans_b=True' "$FILE"
+    else
+        echo "    All $COUNT fixed."
+    fi
+    TOTAL_FIXED=$((TOTAL_FIXED + COUNT))
+done
 
 echo
-
-# Clear Triton cache
 echo "Clearing Triton cache..."
 rm -rf "$HOME/.triton/cache"/* 2>/dev/null || true
 mkdir -p "$HOME/.triton/cache" 2>/dev/null || true
-echo "✓ Triton cache cleared"
+echo "Triton cache cleared."
 
 echo
 echo "=========================================="
-echo "Patch applied successfully!"
+echo "Patch complete!"
 echo "=========================================="
-echo
-echo "Next steps:"
-echo "1. Restart your Python kernel/Jupyter notebook"
-echo "2. Reload the DNABERT-2 model"
-echo "3. The model should now work with the updated Triton API"
-echo
-

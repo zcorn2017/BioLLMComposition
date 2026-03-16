@@ -1,0 +1,31 @@
+# ── Attention contact-map training with focal loss ─────────────────────────
+# Usage:  python scripts/frameworks/attention_contactmap_focal_loss.py \
+#             --config configs/training/attention_contactmap_focal_loss.yaml
+#
+# NOTE: Base model names (DNA / Protein) are read from the data file's
+# spec, NOT from this config.
+
+framework: "attention"
+
+data:
+  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260305_190444.pt"
+
+training:
+  lr: 5.0e-5
+  epochs: 200
+  batch_size: 16
+  num_workers: 4
+  n_runs: 1
+  seed: 42
+  warmup_epochs: 5          # linear warmup before cosine decay
+
+loss:
+  focal_alpha: 0.95         # positive-class weight (high due to ~0.12% positives)
+  focal_gamma: 2.0          # focusing exponent
+
+architecture:
+  head_dim: 64
+
+output:
+  log_dir:  "./runs"
+  save_dir: "./results"

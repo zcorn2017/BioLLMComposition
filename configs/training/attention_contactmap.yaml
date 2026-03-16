@@ -1,0 +1,26 @@
+# ── Attention contact-map training ─────────────────────────────────────────
+# Usage:  python scripts/02_run_training.py --config configs/training/attention_contactmap.yaml
+#
+# NOTE: Base model names (DNA / Protein) are read from the data file's
+# spec, NOT from this config.  This keeps experiments reproducible and
+# prevents mismatches between tokenized data and the model used.
+
+framework: "attention"
+
+data:
+  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260305_190444.pt"
+
+training:
+  lr: 5.0e-5
+  epochs: 100
+  batch_size: 16
+  num_workers: 4
+  n_runs: 1
+  seed: 42
+
+architecture:
+  head_dim: 64
+
+output:
+  log_dir:  "./runs"
+  save_dir: "./results"

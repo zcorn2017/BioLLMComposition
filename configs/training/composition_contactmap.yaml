@@ -1,0 +1,31 @@
+# ── Composition contact-map training ───────────────────────────────────────
+# Usage:  python scripts/02_run_training.py --config configs/training/composition_contactmap.yaml
+#
+# NOTE: Base model names (DNA / Protein) are read from the data file's
+# spec, NOT from this config.  esm_layers is derived from the protein
+# model registry entry at runtime.
+#
+# IMPORTANT: target_layers must be valid for the protein model's layer
+# count.  E.g. for esm2-8M (6 layers) use indices 0..5.
+
+framework: "composition"
+
+data:
+  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260305_190444.pt"
+
+training:
+  lr: 5.0e-5
+  epochs: 100
+  batch_size: 16
+  num_workers: 4
+  n_runs: 1
+  seed: 42
+
+architecture:
+  head_dim: 64
+  num_heads: 16  # must divide prot emb_dim: ESM2-3B=2560 (÷16=160), ESM-C 300M=960 (÷16=60), ESM-C 600M=1152 (÷16=72)
+  target_layers: [0, 3, 5]    # must be < protein model's layer count
+
+output:
+  log_dir:  "./runs"
+  save_dir: "./results"

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Tokenize sequences and precompute padded contact-map labels / masks.
+"""Tokenize sequences and pack raw contact maps for all samples.
 
 Produces a single ``.pt`` file containing tokenised inputs for both DNA
-strands and protein, plus the raw (compact) contact maps.  Padded Y
-tensors and masks are built on-the-fly per sample in the Dataset to
-avoid materialising a dense (N, 2, R, L) array that would OOM.
+strands and the protein, plus compact (variable-size) contact maps.
+**No splitting** is performed here; see ``01_split_datasets.py``.
 
 Usage
 -----
     python scripts/00_precompute_tokens_and_labels.py \
-        --data_path /path/to/residue_wise.pkl \
-        --out_dir   /path/to/processed/embeddings
+        --config configs/precompute/default.yaml
+
+    # Override any value via CLI:
+    python scripts/00_precompute_tokens_and_labels.py \
+        --config configs/precompute/default.yaml \
+        --dna_model dnabert2-117M --prot_model esm2-650M
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime
@@ -20,38 +25,57 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import GroupShuffleSplit
+import yaml
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
-from biollmcomposition.utils.contact_map import set_seed
+from biollmcomposition.models import get_model_info, load_tokenizer
+from biollmcomposition.utils.contact_map import resolve_data_path, set_seed
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data_path", type=str,
-                   default="/home/zcorn/Projects/proteinDNA_data/processed/"
-                           "dna_protein_residue_wise_fullseq_20260219.pkl")
-    p.add_argument("--out_dir", type=str,
-                   default="/home/zcorn/Projects/proteinDNA_data/processed/embeddings")
-    p.add_argument("--max_dna_len", type=int, default=0,
-                   help="0 = auto-detect from data, capped at 512")
-    p.add_argument("--max_prot_len", type=int, default=0,
-                   help="0 = auto-detect from data, capped at 1024")
-    p.add_argument("--train_size", type=float, default=0.8)
-    p.add_argument("--val_size", type=float, default=0.2)
-    p.add_argument("--seed", type=int, default=42)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--config", type=str, required=True,
+                   help="Path to YAML config file")
+    p.add_argument("--data_path", type=str, default=None)
+    p.add_argument("--out_dir", type=str, default=None)
+    p.add_argument("--dna_model", type=str, default=None,
+                   help="Short name override (e.g. dnabert2-117M)")
+    p.add_argument("--prot_model", type=str, default=None,
+                   help="Short name override (e.g. esm2-650M)")
+    p.add_argument("--max_dna_len", type=int, default=None)
+    p.add_argument("--max_prot_len", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
 
+def load_config(args) -> dict:
+    """Merge YAML config with CLI overrides (CLI wins)."""
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    cli = vars(args)
+    if cli.get("data_path"):
+        cfg["data_path"] = cli["data_path"]
+    if cli.get("out_dir"):
+        cfg["out_dir"] = cli["out_dir"]
+    if cli.get("dna_model"):
+        cfg.setdefault("models", {})["dna"] = cli["dna_model"]
+    if cli.get("prot_model"):
+        cfg.setdefault("models", {})["protein"] = cli["prot_model"]
+    if cli.get("max_dna_len") is not None:
+        cfg["max_dna_len"] = cli["max_dna_len"]
+    if cli.get("max_prot_len") is not None:
+        cfg["max_prot_len"] = cli["max_prot_len"]
+    if cli.get("seed") is not None:
+        cfg["seed"] = cli["seed"]
+    return cfg
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
-
-DNA_MODEL = "zhihan1996/DNABERT-2-117M"
-PROT_MODEL = "facebook/esm2_t6_8M_UR50D"
-
 
 def load_data(path_str: str) -> pd.DataFrame:
     path = Path(path_str)
@@ -60,52 +84,51 @@ def load_data(path_str: str) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def auto_max_len(seqs, cap, buffer=10):
+def auto_max_len(seqs, cap: int, buffer: int = 10) -> int:
     """max(seq_lengths) + buffer, capped."""
     return min(cap, max(len(s) for s in seqs if s) + buffer)
 
 
-# ── Per-split processing ─────────────────────────────────────────────────
+# ── Core tokenization ────────────────────────────────────────────────────
 
-def process_split(split_df, dna_tok, prot_tok, R, L, split_name):
-    """Tokenize sequences and pack raw contact maps for one data split.
+def tokenize_and_pack(df: pd.DataFrame, dna_tok, prot_tok,
+                      R: int, L: int) -> dict:
+    """Tokenize all samples and pack raw contact maps.
 
     Contact maps are stored as compact int8 numpy arrays (variable size)
-    instead of a dense (N, 2, R, L) tensor to avoid OOM.  Padding is done
-    on-the-fly inside ``ContactMapDataset.__getitem__``.
+    instead of a dense ``(N, 2, R, L)`` tensor to avoid OOM.
     """
-    n = len(split_df)
-    prot_seqs = split_df["prot_seq"].tolist()
-    dna1_seqs = split_df["dna_seq_1"].tolist()
-    dna2_raw = split_df["dna_seq_2"].tolist()
+    n = len(df)
+    prot_seqs = df["prot_seq"].tolist()
+    dna1_seqs = df["dna_seq_1"].tolist()
+    dna2_raw = df["dna_seq_2"].tolist()
     dna2_seqs = [s if isinstance(s, str) and s else "" for s in dna2_raw]
 
-    print(f"  Tokenizing {split_name} protein ({n}) …")
+    print(f"  Tokenizing protein ({n}) …")
     prot_tokens = prot_tok(
         prot_seqs, return_tensors="pt",
         padding="max_length", max_length=R, truncation=True,
     )
-    print(f"  Tokenizing {split_name} dna_strand_1 ({n}) …")
+    print(f"  Tokenizing dna_strand_1 ({n}) …")
     dna1_tokens = dna_tok(
         dna1_seqs, return_tensors="pt",
         padding="max_length", max_length=L, truncation=True,
     )
-    print(f"  Tokenizing {split_name} dna_strand_2 ({n}) …")
+    print(f"  Tokenizing dna_strand_2 ({n}) …")
     dna2_tokens = dna_tok(
         dna2_seqs, return_tensors="pt",
         padding="max_length", max_length=L, truncation=True,
     )
 
-    # ── pack raw contact maps (compact) ──
-    print(f"  Packing raw contact maps for {split_name} …")
-    contact_maps = []
+    print("  Packing raw contact maps …")
+    contact_maps: list[dict] = []
     total_pos = 0
-    for _, row in tqdm(split_df.iterrows(), total=n,
-                       desc=f"  cm_{split_name}"):
+    for _, row in tqdm(df.iterrows(), total=n, desc="  contact_maps"):
         cm1 = np.asarray(row["contact_map_1"], dtype=np.int8)
         total_pos += cm1.sum()
         cm2_raw = row.get("contact_map_2")
-        cm2 = np.asarray(cm2_raw, dtype=np.int8) if cm2_raw is not None else None
+        cm2 = (np.asarray(cm2_raw, dtype=np.int8)
+               if cm2_raw is not None else None)
         if cm2 is not None:
             total_pos += cm2.sum()
         contact_maps.append({"cm1": cm1, "cm2": cm2})
@@ -114,26 +137,28 @@ def process_split(split_df, dna_tok, prot_tok, R, L, split_name):
         c["cm1"].nbytes + (c["cm2"].nbytes if c["cm2"] is not None else 0)
         for c in contact_maps
     )
-    print(f"  {split_name}: {n} samples, raw cm storage ≈ {cm_bytes / 1e6:.1f} MB, "
+    print(f"  {n} samples, cm storage ≈ {cm_bytes / 1e6:.1f} MB, "
           f"total positives = {total_pos}")
 
-    # ── sanity spot-check on first sample ──
-    row0 = split_df.iloc[0]
-    orig_pos = np.asarray(row0["contact_map_1"]).sum()
-    packed_pos = contact_maps[0]["cm1"].sum()
-    if orig_pos != packed_pos:
-        print(f"  [WARN] sample-0 strand-1: orig={orig_pos}, packed={packed_pos}")
+    # Sanity spot-check
+    row0 = df.iloc[0]
+    if np.asarray(row0["contact_map_1"]).sum() != contact_maps[0]["cm1"].sum():
+        print("  [WARN] sample-0 contact_map_1 mismatch after packing")
+
+    meta: dict = {
+        "pdb_ids": df["pdb_id"].tolist(),
+        "prot_chain_ids": df["prot_chain_id"].tolist(),
+        "dna_entity_types": df["dna_entity_type"].tolist(),
+    }
+    if "cluster_id" in df.columns:
+        meta["cluster_ids"] = df["cluster_id"].tolist()
 
     return {
         "dna1": {k: v for k, v in dna1_tokens.items()},
         "dna2": {k: v for k, v in dna2_tokens.items()},
         "prot": {k: v for k, v in prot_tokens.items()},
         "contact_maps": contact_maps,
-        "meta": {
-            "pdb_ids": split_df["pdb_id"].tolist(),
-            "prot_chain_ids": split_df["prot_chain_id"].tolist(),
-            "dna_entity_types": split_df["dna_entity_type"].tolist(),
-        },
+        "meta": meta,
     }
 
 
@@ -141,69 +166,66 @@ def process_split(split_df, dna_tok, prot_tok, R, L, split_name):
 
 def main():
     args = parse_args()
-    set_seed(args.seed)
-    out_dir = Path(args.out_dir)
+    cfg = load_config(args)
+    seed = cfg.get("seed", 42)
+    set_seed(seed)
+
+    dna_short = cfg["models"]["dna"]
+    prot_short = cfg["models"]["protein"]
+    dna_info = get_model_info(dna_short)
+    prot_info = get_model_info(prot_short)
+
+    out_dir = Path(resolve_data_path(cfg["out_dir"]))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── load ──
-    print(f"Loading data from {args.data_path} …")
-    df = load_data(args.data_path)
+    # ── load data ──
+    data_path = resolve_data_path(cfg["data_path"])
+    print(f"Loading data from {data_path} …")
+    df = load_data(data_path)
     print(f"  {len(df)} samples, columns: {df.columns.tolist()}")
 
-    # ── split ──
-    group_col = "cluster_id" if "cluster_id" in df.columns else "pdb_id"
-    print(f"Splitting by '{group_col}' "
-          f"(train={args.train_size:.0%}, val={args.val_size:.0%})")
-    gss = GroupShuffleSplit(n_splits=1, test_size=args.val_size,
-                           random_state=args.seed)
-    train_idx, val_idx = next(gss.split(df, groups=df[group_col]))
-    train_df = df.iloc[train_idx].reset_index(drop=True)
-    val_df = df.iloc[val_idx].reset_index(drop=True)
-
-    overlap = set(train_df[group_col]) & set(val_df[group_col])
-    assert len(overlap) == 0, f"Group overlap between splits: {overlap}"
-    print(f"  train={len(train_df)}, val={len(val_df)}, "
-          f"groups: train={train_df[group_col].nunique()}, "
-          f"val={val_df[group_col].nunique()}")
-
     # ── max lengths ──
-    all_prot = train_df["prot_seq"].tolist() + val_df["prot_seq"].tolist()
+    all_prot = df["prot_seq"].tolist()
     all_dna = (
-        train_df["dna_seq_1"].tolist() + val_df["dna_seq_1"].tolist()
-        + [s for s in (train_df["dna_seq_2"].tolist()
-                       + val_df["dna_seq_2"].tolist())
+        df["dna_seq_1"].tolist()
+        + [s for s in df["dna_seq_2"].tolist()
            if isinstance(s, str) and s]
     )
-    R = args.max_prot_len if args.max_prot_len > 0 else auto_max_len(all_prot, 1024)
-    L = args.max_dna_len if args.max_dna_len > 0 else auto_max_len(all_dna, 512)
+    max_prot = cfg.get("max_prot_len", 0)
+    max_dna = cfg.get("max_dna_len", 0)
+    R = max_prot if max_prot and max_prot > 0 else auto_max_len(all_prot, 1024)
+    L = max_dna if max_dna and max_dna > 0 else auto_max_len(all_dna, 512)
     print(f"  max_prot_len (R) = {R},  max_dna_len (L) = {L}")
 
     # ── tokenizers ──
-    print(f"Loading tokenizers: {DNA_MODEL} + {PROT_MODEL}")
-    dna_tok = AutoTokenizer.from_pretrained(DNA_MODEL, trust_remote_code=True)
-    prot_tok = AutoTokenizer.from_pretrained(PROT_MODEL)
+    print(f"Loading tokenizers: {dna_info['hf_name']} + {prot_info['hf_name']}")
+    dna_tok = load_tokenizer(dna_short)
+    prot_tok = load_tokenizer(prot_short)
 
-    # ── process ──
-    train_data = process_split(train_df, dna_tok, prot_tok, R, L, "train")
-    val_data = process_split(val_df, dna_tok, prot_tok, R, L, "val")
+    # ── tokenize all samples ──
+    data = tokenize_and_pack(df, dna_tok, prot_tok, R, L)
 
-    # ── save ──
+    # ── spec ──
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     spec = {
+        "dna_model": dna_info["hf_name"],
+        "dna_model_short": dna_short,
+        "prot_model": prot_info["hf_name"],
+        "prot_model_short": prot_short,
         "max_prot_len": R,
         "max_dna_len": L,
-        "dna_model": DNA_MODEL,
-        "prot_model": PROT_MODEL,
-        "n_train": len(train_df),
-        "n_val": len(val_df),
-        "group_col": group_col,
-        "seed": args.seed,
+        "n_samples": len(df),
+        "seed": seed,
         "timestamp": ts,
-        "data_path": str(args.data_path),
+        "source_data": str(cfg["data_path"]),
     }
-    out_path = out_dir / f"contactmap_tokens_labels_dna{L}_prot{R}_{ts}.pt"
+
+    out_name = (f"tokens_{dna_short}_{prot_short}"
+                f"_dna{L}_prot{R}_{ts}.pt")
+    out_path = out_dir / out_name
+
     print(f"\nSaving → {out_path}")
-    torch.save({"spec": spec, "train": train_data, "val": val_data}, out_path)
+    torch.save({"spec": spec, **data}, out_path)
     print("Done.")
 
 

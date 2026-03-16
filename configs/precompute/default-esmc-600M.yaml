@@ -1,0 +1,16 @@
+# ── Precompute: tokenize sequences + pack contact maps ───────────────────
+# Usage:  python scripts/00_precompute_tokens_and_labels.py --config configs/precompute/default.yaml
+
+data_path: "/home/zcorn/Projects/proteinDNA_data/processed/dna_protein_residue_wise_fullseq_20260219.pkl"
+out_dir:   "/home/zcorn/Projects/proteinDNA_data/processed/embeddings"
+
+# Short names from the model registry (see biollmcomposition/models/)
+models:
+  dna: "dnabert2-117M"
+  protein: "esmc-600M"
+
+# 0 = auto-detect from data (capped at 512 / 1024)
+max_dna_len: 0
+max_prot_len: 0
+
+seed: 42

@@ -11,6 +11,11 @@ __pycache__/
 *.csv
 *.pth
 runs/
+results/
+
+slurm/logs/*.out
+slurm/logs/*.err
+!slurm/logs/.gitkeep
 
 .ipynb_checkpoints/
 .vscode/

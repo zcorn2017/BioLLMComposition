@@ -1,0 +1,20 @@
+# ── Dataset splitting ─────────────────────────────────────────────────────
+# Usage:  python scripts/01_split_datasets.py --config configs/splitting/default.yaml
+
+# Path to the .pt produced by 00_precompute_tokens_and_labels.py
+data_pt: "/home/zcorn/Projects/proteinDNA_data/processed/embeddings/tokens_dnabert2-117M_esmc-600M_dna365_prot1024_20260316_155919.pt"
+out_dir: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset"
+
+# "group_shuffle" = GroupShuffleSplit (no group leakage)
+# "random"        = simple random split
+strategy: "group_shuffle"
+
+# Column in the data's meta dict to group by (cluster_id or pdb_id)
+group_col: "cluster_id"
+
+ratios:
+  train: 0.8
+  val:   0.1
+  test:  0.1
+
+seed: 42

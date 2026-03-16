@@ -1,5 +1,8 @@
 """Shared utilities for protein-DNA contact-map prediction training."""
 
+from __future__ import annotations
+
+import os
 import random
 
 import numpy as np
@@ -19,6 +22,53 @@ from sklearn.metrics import (
 # ---------------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------------
+
+_DEFAULT_DATA_ROOT = "/home/zcorn/Projects/proteinDNA_data"
+
+
+def resolve_data_path(path: str) -> str:
+    """Replace the default data root with ``$DATA_ROOT`` if set.
+
+    Allows the same YAML configs to work on both local and remote machines
+    by overriding the data prefix via the ``DATA_ROOT`` environment variable.
+    """
+    data_root = os.environ.get("DATA_ROOT")
+    if data_root and path.startswith(_DEFAULT_DATA_ROOT):
+        return path.replace(_DEFAULT_DATA_ROOT, data_root, 1)
+    return path
+
+
+def load_split_and_resolve_data(cfg: dict) -> tuple:
+    """Load split file and resolve data_pt from its ``source_pt`` metadata.
+
+    If ``data.data_pt`` is present in *cfg* it is used directly; otherwise
+    the split file's ``source_pt`` key provides the path.  Both paths go
+    through :func:`resolve_data_path` for ``$DATA_ROOT`` portability.
+
+    Returns ``(data, data_spec, split, split_spec)``.
+    """
+    import torch
+
+    split_path = resolve_data_path(cfg["data"]["split_pt"])
+    split = torch.load(split_path, map_location="cpu", weights_only=False)
+    split_spec = split["spec"]
+
+    data_pt = cfg["data"].get("data_pt")
+    if not data_pt:
+        data_pt = split.get("source_pt")
+        if not data_pt:
+            raise ValueError(
+                "data_pt not in config and split file has no 'source_pt' key"
+            )
+    data_path = resolve_data_path(data_pt)
+
+    data = torch.load(data_path, map_location="cpu", weights_only=False)
+    data_spec = data["spec"]
+
+    print(f"Split:  {split_path}")
+    print(f"Data:   {data_path}")
+    return data, data_spec, split, split_spec
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -41,11 +91,9 @@ def mask_special_tokens(attention_mask: torch.Tensor) -> torch.Tensor:
     squeezed = mask.dim() == 1
     if squeezed:
         mask = mask.unsqueeze(0)
-    # Remove BOS / CLS at index 0
     mask[:, 0] = 0
-    # Remove EOS / SEP = last non-pad position
     orig = attention_mask if attention_mask.dim() == 2 else attention_mask.unsqueeze(0)
-    last_idx = orig.sum(dim=1).long() - 1  # (N,)
+    last_idx = orig.sum(dim=1).long() - 1
     rows = torch.arange(mask.size(0), device=mask.device)
     mask[rows, last_idx.clamp(min=0)] = 0
     return mask.squeeze(0) if squeezed else mask
@@ -62,18 +110,43 @@ def masked_bce_loss(logits, targets, prot_mask, dna_mask):
     ----------
     logits    : (B, 2, R, L)
     targets   : (B, 2, R, L)
-    prot_mask : (B, R)   — 1 at valid protein positions
-    dna_mask  : (B, 2, L) — 1 at valid DNA positions per strand
-
-    Returns
-    -------
-    Scalar loss averaged over valid entries.
+    prot_mask : (B, R)   -- 1 at valid protein positions
+    dna_mask  : (B, 2, L) -- 1 at valid DNA positions per strand
     """
     bce = nn.functional.binary_cross_entropy_with_logits(
         logits, targets, reduction="none",
     )
     mask = prot_mask[:, None, :, None].float() * dna_mask[:, :, None, :].float()
     return (bce * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def masked_focal_loss(logits, targets, prot_mask, dna_mask,
+                      alpha: float = 0.95, gamma: float = 2.0):
+    """Masked focal loss over contact-map logits.
+
+    Focal loss down-weights well-classified (easy) negatives so the model
+    focuses on hard positives, counteracting extreme class imbalance.
+
+    Parameters
+    ----------
+    logits    : (B, 2, R, L)
+    targets   : (B, 2, R, L)
+    prot_mask : (B, R)   -- 1 at valid protein positions
+    dna_mask  : (B, 2, L) -- 1 at valid DNA positions per strand
+    alpha     : Balance weight for the positive class (1-alpha for negatives).
+    gamma     : Focusing exponent; higher values down-weight easy examples more.
+    """
+    # Numerically stable BCE from logits
+    bce = nn.functional.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none",
+    )
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1.0 - p) * (1.0 - targets)
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    focal_weight = alpha_t * (1.0 - p_t) ** gamma
+
+    mask = prot_mask[:, None, :, None].float() * dna_mask[:, :, None, :].float()
+    return (focal_weight * bce * mask).sum() / mask.sum().clamp(min=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +157,6 @@ def flatten_valid(logits, targets, prot_mask, dna_mask):
     """Flatten logits / targets at valid mask positions to 1-D numpy arrays.
 
     Returns ``(y_true_1d, y_score_1d)`` as float32 numpy arrays.
-    NaN scores are replaced with 0.0.
     """
     mask = (
         prot_mask[:, None, :, None].float() * dna_mask[:, :, None, :].float()
@@ -98,19 +170,7 @@ def compute_contactmap_metrics(y_true_1d, y_score_1d, thresh=0.5,
                                n_positives_for_topL=None):
     """Compute metrics for contact-map predictions.
 
-    Parameters
-    ----------
-    y_true_1d  : 1-D numpy array of ground-truth binary labels.
-    y_score_1d : 1-D numpy array of predicted scores in [0, 1].
-    thresh     : Decision threshold for P/R/F1/MCC.
-    n_positives_for_topL : int or None
-        If given, compute top-L precision using this as L (typically the
-        number of true contacts or the protein length).  If None, L is set
-        to the number of positives in y_true.
-
-    Returns
-    -------
-    dict with keys: ``pr_auc``, ``roc_auc``, ``mcc``,
+    Returns dict with keys: ``pr_auc``, ``roc_auc``, ``mcc``,
     ``precision``, ``recall``, ``f1``, ``top_L_precision``.
     """
     y_int = y_true_1d.astype(int)
@@ -140,6 +200,26 @@ def compute_contactmap_metrics(y_true_1d, y_score_1d, thresh=0.5,
 
 
 # ---------------------------------------------------------------------------
+# Data subsetting
+# ---------------------------------------------------------------------------
+
+def subset_data(data: dict, indices) -> dict:
+    """Subset a precomputed data dict by sample indices.
+
+    Compatible with :class:`ContactMapDataset` input format.
+    ``data`` must have top-level keys ``dna1``, ``dna2``, ``prot``
+    (each a dict of tensors) and ``contact_maps`` (a list).
+    """
+    idx = list(indices)
+    return {
+        "dna1": {k: v[idx] for k, v in data["dna1"].items()},
+        "dna2": {k: v[idx] for k, v in data["dna2"].items()},
+        "prot": {k: v[idx] for k, v in data["prot"].items()},
+        "contact_maps": [data["contact_maps"][i] for i in idx],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
@@ -151,8 +231,9 @@ class ContactMapDataset(Dataset):
     ``(2, R, L)`` float32 tensor, which keeps total memory proportional to
     the actual data rather than ``N * 2 * R * L``.
 
-    Expects ``split_data`` dict produced by
-    ``scripts/00_precompute_tokens_and_labels.py``.
+    Expects a data dict with keys ``dna1``, ``dna2``, ``prot`` (each
+    containing ``input_ids`` and ``attention_mask`` tensors) and
+    ``contact_maps`` (a list of ``{"cm1": np.array, "cm2": ...}``).
     """
 
     def __init__(self, split_data: dict):
@@ -163,8 +244,8 @@ class ContactMapDataset(Dataset):
         self.prot_ids = split_data["prot"]["input_ids"]
         self.prot_am = split_data["prot"]["attention_mask"]
         self.contact_maps = split_data["contact_maps"]
-        self.R = self.prot_ids.size(1)   # max_prot_len (token dim)
-        self.L = self.dna1_ids.size(1)   # max_dna_len  (token dim)
+        self.R = self.prot_ids.size(1)
+        self.L = self.dna1_ids.size(1)
 
     def __len__(self):
         return len(self.contact_maps)
@@ -172,7 +253,6 @@ class ContactMapDataset(Dataset):
     def __getitem__(self, idx):
         R, L = self.R, self.L
 
-        # ── build padded Y (2, R, L) from raw contact maps ──
         Y = torch.zeros(2, R, L)
         cm = self.contact_maps[idx]
         cm1 = cm["cm1"]
@@ -188,7 +268,6 @@ class ContactMapDataset(Dataset):
                 cm2[: rend - 1, : lend2 - 1].astype(np.float32),
             )
 
-        # ── masks (derived from attention_mask, special tokens removed) ──
         prot_mask = mask_special_tokens(self.prot_am[idx])
         dna_mask = torch.stack([
             mask_special_tokens(self.dna1_am[idx]),

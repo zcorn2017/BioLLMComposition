@@ -1,0 +1,37 @@
+# Portable conda environment for cluster deployment.
+#
+# Derived from environment-py314-llm.yml with:
+#   - System/NVIDIA libs removed (provided by cluster modules)
+#   - PyTorch installed from pip with appropriate CUDA index
+#
+# Usage:
+#   conda env create -f environment-cluster.yml
+#   conda activate py314-llm
+
+name: py314-llm
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.15
+  - pip
+  - pip:
+      - einops
+      - huggingface-hub
+      - matplotlib
+      - numpy
+      - pandas
+      - pyarrow
+      - python-dotenv
+      - pyyaml
+      - regex
+      - requests
+      - safetensors
+      - scikit-learn
+      - scipy
+      - tensorboard
+      - tokenizers
+      - torch
+      - torchvision
+      - tqdm
+      - transformers==4.48.1
