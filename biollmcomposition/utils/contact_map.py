@@ -11,6 +11,7 @@ from torch import nn
 from torch.utils.data import Dataset
 from sklearn.metrics import (
     average_precision_score,
+    balanced_accuracy_score,
     matthews_corrcoef,
     precision_score,
     recall_score,
@@ -171,7 +172,8 @@ def compute_contactmap_metrics(y_true_1d, y_score_1d, thresh=0.5,
     """Compute metrics for contact-map predictions.
 
     Returns dict with keys: ``pr_auc``, ``roc_auc``, ``mcc``,
-    ``precision``, ``recall``, ``f1``, ``top_L_precision``.
+    ``balanced_accuracy``, ``precision``, ``recall``, ``f1``,
+    ``top_L_precision``.
     """
     y_int = y_true_1d.astype(int)
     y_pred = (y_score_1d >= thresh).astype(int)
@@ -192,6 +194,7 @@ def compute_contactmap_metrics(y_true_1d, y_score_1d, thresh=0.5,
         "pr_auc": pr_auc,
         "roc_auc": roc_auc,
         "mcc": mcc,
+        "balanced_accuracy": balanced_accuracy_score(y_int, y_pred),
         "precision": precision_score(y_int, y_pred, zero_division=0),
         "recall": recall_score(y_int, y_pred, zero_division=0),
         "f1": f1_score(y_int, y_pred, zero_division=0),
@@ -234,45 +237,75 @@ class ContactMapDataset(Dataset):
     Expects a data dict with keys ``dna1``, ``dna2``, ``prot`` (each
     containing ``input_ids`` and ``attention_mask`` tensors) and
     ``contact_maps`` (a list of ``{"cm1": np.array, "cm2": ...}``).
+
+    Parameters
+    ----------
+    split_data : dict
+        Subset of a precomputed data dict (see :func:`subset_data`).
+    dna_has_special_tokens : bool
+        If ``True`` (default, DNABERT-2), the DNA tokenizer prepends
+        CLS and appends SEP, so contact-map labels start at position 1
+        and DNA masks go through :func:`mask_special_tokens`.
+        If ``False`` (NTv3), the DNA tokens are plain nucleotides with
+        no CLS/SEP, so labels start at position 0 and the raw
+        ``attention_mask`` is used directly.
     """
 
-    def __init__(self, split_data: dict):
+    def __init__(self, split_data: dict,
+                 dna_has_special_tokens: bool = True):
         self.dna1_ids = split_data["dna1"]["input_ids"]
-        self.dna1_am = split_data["dna1"]["attention_mask"]
         self.dna2_ids = split_data["dna2"]["input_ids"]
-        self.dna2_am = split_data["dna2"]["attention_mask"]
         self.prot_ids = split_data["prot"]["input_ids"]
         self.prot_am = split_data["prot"]["attention_mask"]
+
+        # Some tokenizers (e.g. NTv3) don't produce attention_mask;
+        # fall back to deriving it from the pad_token_id (usually 1).
+        def _get_am(d: dict) -> torch.Tensor:
+            if "attention_mask" in d:
+                return d["attention_mask"]
+            pad_id = 1  # NTv3 pad token id
+            return (d["input_ids"] != pad_id).long()
+
+        self.dna1_am = _get_am(split_data["dna1"])
+        self.dna2_am = _get_am(split_data["dna2"])
         self.contact_maps = split_data["contact_maps"]
         self.R = self.prot_ids.size(1)
         self.L = self.dna1_ids.size(1)
+        self.dna_has_special_tokens = dna_has_special_tokens
 
     def __len__(self):
         return len(self.contact_maps)
 
     def __getitem__(self, idx):
         R, L = self.R, self.L
+        dna_off = 1 if self.dna_has_special_tokens else 0
 
         Y = torch.zeros(2, R, L)
         cm = self.contact_maps[idx]
         cm1 = cm["cm1"]
         rend = min(1 + cm1.shape[0], R)
-        lend1 = min(1 + cm1.shape[1], L)
-        Y[0, 1:rend, 1:lend1] = torch.from_numpy(
-            cm1[: rend - 1, : lend1 - 1].astype(np.float32),
+        lend1 = min(dna_off + cm1.shape[1], L)
+        Y[0, 1:rend, dna_off:lend1] = torch.from_numpy(
+            cm1[: rend - 1, : lend1 - dna_off].astype(np.float32),
         )
         cm2 = cm["cm2"]
         if cm2 is not None:
-            lend2 = min(1 + cm2.shape[1], L)
-            Y[1, 1:rend, 1:lend2] = torch.from_numpy(
-                cm2[: rend - 1, : lend2 - 1].astype(np.float32),
+            lend2 = min(dna_off + cm2.shape[1], L)
+            Y[1, 1:rend, dna_off:lend2] = torch.from_numpy(
+                cm2[: rend - 1, : lend2 - dna_off].astype(np.float32),
             )
 
         prot_mask = mask_special_tokens(self.prot_am[idx])
-        dna_mask = torch.stack([
-            mask_special_tokens(self.dna1_am[idx]),
-            mask_special_tokens(self.dna2_am[idx]),
-        ])
+        if self.dna_has_special_tokens:
+            dna_mask = torch.stack([
+                mask_special_tokens(self.dna1_am[idx]),
+                mask_special_tokens(self.dna2_am[idx]),
+            ])
+        else:
+            dna_mask = torch.stack([
+                self.dna1_am[idx],
+                self.dna2_am[idx],
+            ])
 
         return {
             "dna1_input_ids": self.dna1_ids[idx],

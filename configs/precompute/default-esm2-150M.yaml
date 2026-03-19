@@ -7,7 +7,7 @@ out_dir:   "/home/zcorn/Projects/proteinDNA_data/processed/embeddings"
 # Short names from the model registry (see biollmcomposition/models/)
 models:
   dna: "dnabert2-117M"
-  protein: "esm2-8M"
+  protein: "esm2-150M"
 
 # 0 = auto-detect from data (capped at 512 / 1024)
 max_dna_len: 0

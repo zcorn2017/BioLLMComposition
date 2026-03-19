@@ -11,7 +11,7 @@
 framework: "composition"
 
 data:
-  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260305_190444.pt"
+  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260316_160604.pt"
 
 training:
   lr: 5.0e-5

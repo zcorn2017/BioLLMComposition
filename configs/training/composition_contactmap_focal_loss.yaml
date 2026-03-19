@@ -12,12 +12,14 @@
 framework: "composition"
 
 data:
-  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260316_144929.pt"
+  # split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260316_160604.pt" #ESM-C-600M
+  # split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260316_181647.pt" #ESM2-150M
+  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260319_121910.pt" #NTv3-100M_ESMC-600M
 
 training:
   lr: 5.0e-5
-  epochs: 200
-  batch_size: 16
+  epochs: 100
+  batch_size:  16  # reduced from 16 to avoid OOM with ESM2-650M on ~31 GB GPU
   num_workers: 4
   n_runs: 1
   seed: 42
@@ -29,8 +31,9 @@ loss:
 
 architecture:
   head_dim: 64
-  num_heads: 16  # must divide prot emb_dim: ESM2-3B=2560 (÷16=160), ESM-C 300M=960 (÷16=60), ESM-C 600M=1152 (÷16=72)
-  target_layers: [0, 3, 5]  # must be < protein model's layer count
+  num_heads: 16  # must divide prot emb_dim: ESM2-650M=1280 (÷16=80), ESM2-3B=2560 (÷16=160)
+  target_layers: [0, 5, 10]  # must be < protein model's layer count
+  gradient_checkpointing: false  # trade compute for memory (avoids OOM on ~31 GB GPU)
 
 output:
   log_dir:  "./runs"

@@ -175,15 +175,18 @@ def main():
     train_data = subset_data(data, split["train_idx"])
     val_data = subset_data(data, split["val_idx"])
 
+    dna_special = dna_info.get("has_special_tokens", True)
     nw = t.get("num_workers", 4)
     bs = t.get("batch_size", 16)
     train_loader = DataLoader(
-        ContactMapDataset(train_data), batch_size=bs, shuffle=True,
+        ContactMapDataset(train_data, dna_has_special_tokens=dna_special),
+        batch_size=bs, shuffle=True,
         num_workers=nw, pin_memory=(device.type == "cuda"),
         persistent_workers=(nw > 0),
     )
     val_loader = DataLoader(
-        ContactMapDataset(val_data), batch_size=bs,
+        ContactMapDataset(val_data, dna_has_special_tokens=dna_special),
+        batch_size=bs,
         num_workers=nw, pin_memory=(device.type == "cuda"),
         persistent_workers=(nw > 0),
     )

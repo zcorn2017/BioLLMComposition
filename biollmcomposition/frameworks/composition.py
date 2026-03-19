@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +118,14 @@ class CompositionContactMapModel(nn.Module):
                  num_heads: int = 20, head_dim: int = 64,
                  target_layers: list[int] | None = None,
                  esm_layers: int = 6,
-                 prot_family: str = "esm2"):
+                 prot_family: str = "esm2",
+                 gradient_checkpointing: bool = False):
         super().__init__()
         self.dna_lm = dna_lm
         self.prot_lm = prot_lm
         self.target_layers = target_layers or [0, 3, 5]
         self.esm_layers = esm_layers
+        self.gradient_checkpointing = gradient_checkpointing
 
         adapter_cls = _ENCODER_ADAPTERS.get(prot_family)
         if adapter_cls is None:
@@ -172,7 +175,13 @@ class CompositionContactMapModel(nn.Module):
 
         counter = 0
         for i in range(self.esm_layers):
-            prot = self._enc.apply_layer(i, prot, prot_mask)
+            if self.gradient_checkpointing and self.training:
+                prot = checkpoint(
+                    lambda h, m, idx=i: self._enc.apply_layer(idx, h, m),
+                    prot, prot_mask, use_reentrant=True,
+                )
+            else:
+                prot = self._enc.apply_layer(i, prot, prot_mask)
             if i in self.target_layers:
                 # Cross-attention is float32; cast inputs to match (encoder may be bf16)
                 q = prot.float()
@@ -186,9 +195,10 @@ class CompositionContactMapModel(nn.Module):
                 counter += 1
 
         prot = self._enc.final_norm(prot)
+        prot_f = prot.float()
 
-        cm1 = self.contact_head(prot, dna1_h)
-        cm2 = self.contact_head(prot, dna2_h)
+        cm1 = self.contact_head(prot_f, dna1_h)
+        cm2 = self.contact_head(prot_f, dna2_h)
         return torch.stack([cm1, cm2], dim=1)
 
 
@@ -239,4 +249,5 @@ def build_model(dna_lm, prot_lm, dna_info: dict, prot_info: dict,
         target_layers=target_layers,
         esm_layers=esm_layers,
         prot_family=prot_family,
+        gradient_checkpointing=arch_cfg.get("gradient_checkpointing", False),
     ).to(device)

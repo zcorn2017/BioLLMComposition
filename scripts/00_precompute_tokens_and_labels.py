@@ -92,7 +92,8 @@ def auto_max_len(seqs, cap: int, buffer: int = 10) -> int:
 # ── Core tokenization ────────────────────────────────────────────────────
 
 def tokenize_and_pack(df: pd.DataFrame, dna_tok, prot_tok,
-                      R: int, L: int) -> dict:
+                      R: int, L: int,
+                      dna_has_special_tokens: bool = True) -> dict:
     """Tokenize all samples and pack raw contact maps.
 
     Contact maps are stored as compact int8 numpy arrays (variable size)
@@ -104,21 +105,30 @@ def tokenize_and_pack(df: pd.DataFrame, dna_tok, prot_tok,
     dna2_raw = df["dna_seq_2"].tolist()
     dna2_seqs = [s if isinstance(s, str) and s else "" for s in dna2_raw]
 
+    dna_tok_kwargs: dict = dict(
+        return_tensors="pt", padding="max_length",
+        max_length=L, truncation=True,
+    )
+    if not dna_has_special_tokens:
+        dna_tok_kwargs["add_special_tokens"] = False
+
     print(f"  Tokenizing protein ({n}) …")
     prot_tokens = prot_tok(
         prot_seqs, return_tensors="pt",
         padding="max_length", max_length=R, truncation=True,
     )
     print(f"  Tokenizing dna_strand_1 ({n}) …")
-    dna1_tokens = dna_tok(
-        dna1_seqs, return_tensors="pt",
-        padding="max_length", max_length=L, truncation=True,
-    )
+    dna1_tokens = dict(dna_tok(dna1_seqs, **dna_tok_kwargs))
     print(f"  Tokenizing dna_strand_2 ({n}) …")
-    dna2_tokens = dna_tok(
-        dna2_seqs, return_tensors="pt",
-        padding="max_length", max_length=L, truncation=True,
-    )
+    dna2_tokens = dict(dna_tok(dna2_seqs, **dna_tok_kwargs))
+
+    # Some tokenizers (e.g. NTv3) omit attention_mask; derive from pad tokens
+    pad_id = dna_tok.pad_token_id
+    for tok_dict in (dna1_tokens, dna2_tokens):
+        if "attention_mask" not in tok_dict and pad_id is not None:
+            tok_dict["attention_mask"] = (
+                tok_dict["input_ids"] != pad_id
+            ).long()
 
     print("  Packing raw contact maps …")
     contact_maps: list[dict] = []
@@ -191,10 +201,22 @@ def main():
         + [s for s in df["dna_seq_2"].tolist()
            if isinstance(s, str) and s]
     )
+    dna_has_special_tokens = dna_info.get("has_special_tokens", True)
+
     max_prot = cfg.get("max_prot_len", 0)
     max_dna = cfg.get("max_dna_len", 0)
     R = max_prot if max_prot and max_prot > 0 else auto_max_len(all_prot, 1024)
     L = max_dna if max_dna and max_dna > 0 else auto_max_len(all_dna, 512)
+
+    # NTv3 full U-Net requires sequence length divisible by 2^num_downsamples.
+    # In stem_only mode the U-Net is bypassed, so no alignment is needed.
+    num_ds = dna_info.get("num_downsamples", 0)
+    stem_only = dna_info.get("stem_only", False)
+    if num_ds > 0 and not stem_only:
+        alignment = 2 ** num_ds
+        L = ((L + alignment - 1) // alignment) * alignment
+        print(f"  DNA length rounded to multiple of {alignment} for U-Net")
+
     print(f"  max_prot_len (R) = {R},  max_dna_len (L) = {L}")
 
     # ── tokenizers ──
@@ -203,7 +225,8 @@ def main():
     prot_tok = load_tokenizer(prot_short)
 
     # ── tokenize all samples ──
-    data = tokenize_and_pack(df, dna_tok, prot_tok, R, L)
+    data = tokenize_and_pack(df, dna_tok, prot_tok, R, L,
+                             dna_has_special_tokens=dna_has_special_tokens)
 
     # ── spec ──
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
