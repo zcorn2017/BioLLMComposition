@@ -40,6 +40,7 @@ from tqdm import tqdm
 
 from biollmcomposition.frameworks import get_framework
 from biollmcomposition.models import get_model_info, load_model
+from biollmcomposition.utils.source_snapshot import log_architecture_sources
 from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
@@ -454,16 +455,13 @@ def main():
 
         # Snapshot source code for full reproducibility
         writer.add_text("source/training_script",
-                        f"```python\n{Path(__file__).read_text()}\n```")
-        writer.add_text("source/framework",
-                        f"```python\n{inspect.getsource(type(framework))}\n```"
-                        if hasattr(framework, '__module__') and not inspect.ismodule(framework)
-                        else f"```python\n{inspect.getsource(framework)}\n```")
+                        f"```python\n{Path(__file__).read_text(encoding='utf-8')}\n```")
+        log_architecture_sources(writer, framework, dna_info, prot_info)
         from biollmcomposition.utils import contact_map as _cm_mod
         writer.add_text("source/contact_map_utils",
                         f"```python\n{inspect.getsource(_cm_mod)}\n```")
         writer.add_text("source/config_yaml",
-                        f"```yaml\n{Path(args.config).read_text()}\n```")
+                        f"```yaml\n{Path(args.config).read_text(encoding='utf-8')}\n```")
 
         model = framework.build_model(
             dna_lm, prot_lm, dna_info, prot_info, a, device=str(device),

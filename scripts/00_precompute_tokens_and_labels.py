@@ -209,10 +209,10 @@ def main():
     L = max_dna if max_dna and max_dna > 0 else auto_max_len(all_dna, 512)
 
     # NTv3 full U-Net requires sequence length divisible by 2^num_downsamples.
-    # In stem_only mode the U-Net is bypassed, so no alignment is needed.
+    # stem / first_hidden modes keep full length L; only "full" needs alignment.
     num_ds = dna_info.get("num_downsamples", 0)
-    stem_only = dna_info.get("stem_only", False)
-    if num_ds > 0 and not stem_only:
+    ntv3_full_unet = dna_info.get("embed_mode") == "full"
+    if num_ds > 0 and ntv3_full_unet:
         alignment = 2 ** num_ds
         L = ((L + alignment - 1) // alignment) * alignment
         print(f"  DNA length rounded to multiple of {alignment} for U-Net")

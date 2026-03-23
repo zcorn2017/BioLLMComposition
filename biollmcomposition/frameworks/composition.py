@@ -168,6 +168,10 @@ class CompositionContactMapModel(nn.Module):
         dna_cat_am = torch.cat([batch["dna1_attention_mask"],
                                 batch["dna2_attention_mask"]], dim=1)
         dna_cat_kpm = ~dna_cat_am.bool()
+        all_masked = dna_cat_kpm.all(dim=1)
+        if all_masked.any():
+            dna_cat_kpm = dna_cat_kpm.clone()
+            dna_cat_kpm[all_masked, 0] = False
 
         prot_am = batch["prot_attention_mask"]
         prot_mask = self._enc.prepare_mask(prot_am, batch["prot_input_ids"])
@@ -190,7 +194,6 @@ class CompositionContactMapModel(nn.Module):
                     query=q, key=kv, value=kv,
                     key_padding_mask=dna_cat_kpm,
                 )
-                attn_out = torch.nan_to_num(attn_out, nan=0.0)
                 prot = prot + self.post_attn_norms[counter](attn_out).to(prot.dtype)
                 counter += 1
 

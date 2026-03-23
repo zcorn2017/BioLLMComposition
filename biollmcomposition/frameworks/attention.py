@@ -10,6 +10,42 @@ import torch
 from torch import nn
 
 
+class _Esm2HiddenExtractor:
+    """Hidden-state extractor for HuggingFace ESM2 models."""
+
+    def __init__(self, prot_lm):
+        self.prot_lm = prot_lm
+
+    def __call__(self, input_ids, attention_mask):
+        out = self.prot_lm(
+            input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        return out.hidden_states[-1]
+
+
+class _EsmcHiddenExtractor:
+    """Hidden-state extractor for ``esm`` package ESM-C models."""
+
+    def __init__(self, prot_lm):
+        self.prot_lm = prot_lm
+
+    def __call__(self, input_ids, attention_mask):
+        h = self.prot_lm.embed(input_ids)
+        sequence_id = attention_mask.bool()
+        chain_id = torch.ones_like(input_ids, dtype=torch.int64)
+        for block in self.prot_lm.transformer.blocks:
+            h = block(h, sequence_id, None, None, chain_id)
+        return self.prot_lm.transformer.norm(h)
+
+
+_PROT_HIDDEN_EXTRACTORS = {
+    "esm2": _Esm2HiddenExtractor,
+    "esmc": _EsmcHiddenExtractor,
+}
+
+
 class ContactMapHead(nn.Module):
     """Bilinear contact head: score(r, l) = prot_proj[r] . dna_proj[l]."""
 
@@ -33,10 +69,17 @@ class AttentionContactMapModel(nn.Module):
     """
 
     def __init__(self, dna_lm, prot_lm, dna_emb_dim: int, prot_emb_dim: int,
-                 head_dim: int = 64):
+                 head_dim: int = 64, prot_family: str = "esm2"):
         super().__init__()
         self.dna_lm = dna_lm
         self.prot_lm = prot_lm
+        extractor_cls = _PROT_HIDDEN_EXTRACTORS.get(prot_family)
+        if extractor_cls is None:
+            raise ValueError(
+                f"No protein hidden extractor for family '{prot_family}'. "
+                f"Supported: {sorted(_PROT_HIDDEN_EXTRACTORS)}"
+            )
+        self._prot_hidden_extractor = extractor_cls(prot_lm)
 
         self.dna_proj = nn.Linear(dna_emb_dim, prot_emb_dim)
         self.attn = nn.MultiheadAttention(
@@ -59,14 +102,21 @@ class AttentionContactMapModel(nn.Module):
 
     def _prot_hidden(self, input_ids, attention_mask):
         with torch.no_grad():
-            out = self.prot_lm(input_ids, attention_mask=attention_mask,
-                               output_hidden_states=True)
-        return out.hidden_states[-1]
+            return self._prot_hidden_extractor(input_ids, attention_mask)
 
     def _cross_attn_strand(self, prot_h, dna_h, dna_am):
+        kpm = ~dna_am.bool()
+        # Samples with all-padding DNA (e.g. missing strand 2) mask every
+        # key position, making softmax produce NaN.  Unmask one dummy
+        # position so softmax stays finite; those strands are excluded by
+        # dna_mask in loss/eval so the output is unused.
+        all_masked = kpm.all(dim=1)
+        if all_masked.any():
+            kpm = kpm.clone()
+            kpm[all_masked, 0] = False
         out, _ = self.attn(
             query=prot_h.float(), key=dna_h, value=dna_h,
-            key_padding_mask=~dna_am.bool(),
+            key_padding_mask=kpm,
         )
         return self.post_attn_norm(out) + prot_h.float()
 
@@ -97,4 +147,5 @@ def build_model(dna_lm, prot_lm, dna_info: dict, prot_info: dict,
         dna_emb_dim=dna_info["emb_dim"],
         prot_emb_dim=prot_info["emb_dim"],
         head_dim=arch_cfg.get("head_dim", 64),
+        prot_family=prot_info.get("family", "esm2"),
     ).to(device)

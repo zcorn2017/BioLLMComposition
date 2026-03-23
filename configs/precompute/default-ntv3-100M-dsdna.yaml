@@ -7,7 +7,7 @@
 # biollmcomposition/models/ntv3.py): no DNA length alignment.  Use
 # embed_mode "full" in the registry if you need the entire U-Net output.
 
-data_path: "/home/zcorn/Projects/proteinDNA_data/processed/dna_protein_residue_wise_fullseq_20260219.pkl"
+data_path: "/home/zcorn/Projects/proteinDNA_data/processed/dna_protein_residue_wise_dsdna_20260219.pkl"
 out_dir:   "/home/zcorn/Projects/proteinDNA_data/processed/embeddings"
 
 # Short names from the model registry (see biollmcomposition/models/)

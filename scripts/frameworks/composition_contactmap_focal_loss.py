@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib
 import math
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from biollmcomposition.frameworks.composition import (
     build_model,
 )
 from biollmcomposition.models import get_model_info, load_model
+from biollmcomposition.utils.source_snapshot import log_architecture_sources
 from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
@@ -116,6 +118,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, device,
                                  alpha=focal_alpha, gamma=focal_gamma)
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
         total_loss += loss.item() * batch["Y"].size(0)
@@ -235,6 +238,9 @@ def main():
                         f"Protein: {prot_info['hf_name']} ({prot_short})")
         writer.add_text("loss",
                         f"Focal loss: alpha={focal_alpha}, gamma={focal_gamma}")
+        log_architecture_sources(
+            writer, importlib.import_module(build_model.__module__),
+            dna_info, prot_info)
 
         model = build_model(dna_lm, prot_lm, dna_info, prot_info, a,
                             device=str(device))

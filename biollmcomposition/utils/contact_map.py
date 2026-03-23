@@ -175,6 +175,10 @@ def compute_contactmap_metrics(y_true_1d, y_score_1d, thresh=0.5,
     ``balanced_accuracy``, ``precision``, ``recall``, ``f1``,
     ``top_L_precision``.
     """
+    y_score_1d = np.asarray(y_score_1d, dtype=np.float64)
+    y_score_1d = np.nan_to_num(y_score_1d, nan=0.0, posinf=1.0, neginf=0.0)
+    y_score_1d = np.clip(y_score_1d, 0.0, 1.0)
+
     y_int = y_true_1d.astype(int)
     y_pred = (y_score_1d >= thresh).astype(int)
     both_classes = len(np.unique(y_int)) > 1

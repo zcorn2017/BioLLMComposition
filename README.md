@@ -60,3 +60,9 @@ python scripts/frameworks/attention_contactmap.py \
 # 3. Train composition model
 python scripts/frameworks/composition_contactmap.py \
     --data_pt /path/to/contactmap_tokens_labels_*.pt --epochs 100
+
+
+diff: comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl253034_focal_a0.95_g2.0_20260320_111245 vs comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl253034_focal_a0.95_g2.0_20260320_111245 ntv3 changed to first layer.
+
+comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl0510_focal_a0.95_g2.0_20260319_122013 vs 
+runs/comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl253034_focal_a0.95_g2.0_20260320_004337 changed injected layers tl0510 to tl253034

@@ -29,6 +29,7 @@ eval "$(conda shell.bash hook)"
 conda activate py314-llm
 
 export DATA_ROOT="$HOME/Projects/proteinDNA_data"
+# Compute nodes have no HF egress; models must already be in ~/.cache/huggingface (see slurm/setup_env*.sh).
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 

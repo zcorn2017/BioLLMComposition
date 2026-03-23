@@ -68,7 +68,8 @@ push: ## Rsync code to remote (excludes data, results, runs)
 # ── Sync training data ──────────────────────────────────────────────────
 push-data: ## Rsync only embeddings/ and split_dataset/
 	@echo "── [$(TARGET)] Pushing data to $(REMOTE_DATA_DEST) ──"
-	rsync -avzP --mkpath --include='embeddings/***' --include='split_dataset/***' --exclude='*' $(LOCAL_DATA)/processed/ $(REMOTE_DATA_DEST)/processed/
+	ssh $(REMOTE) 'mkdir -p $(REMOTE_DATA)/processed'
+	rsync -avzP --include='embeddings/***' --include='split_dataset/***' --exclude='*' $(LOCAL_DATA)/processed/ $(REMOTE_DATA_DEST)/processed/
 	@echo "── Data sync complete ──"
 
 # ── Fetch results ────────────────────────────────────────────────────────

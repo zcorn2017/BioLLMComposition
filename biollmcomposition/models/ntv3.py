@@ -6,11 +6,10 @@ upsampling, yielding nucleotide-resolution embeddings.
 
 Loaded via HuggingFace ``AutoModelForMaskedLM`` with
 ``trust_remote_code=True``.  A thin wrapper
-(:class:`NTv3EmbeddingWrapper`) extracts the final hidden states so
-that the output interface matches DNABERT-2 (``out.last_hidden_state``).
-
-Sequence lengths must be divisible by ``2 ** num_downsamples`` (128 for
-the standard 7-downsample variants).
+(:class:`NTv3EmbeddingWrapper`) exposes ``out.last_hidden_state`` like
+DNABERT-2.  Default ``embed_mode="first_hidden"`` uses the first
+conv-tower hidden state at full length; only ``embed_mode="full"`` needs
+``L`` divisible by ``2 ** num_downsamples`` (128 for 7 downsamples).
 
 References
 ----------
@@ -39,35 +38,53 @@ def _ensure_ntv3_modules_on_path() -> None:
     NTv3's modeling file uses ``from configuration_ntv3_pretrained import …``
     (absolute, not relative), so the check fails.  Putting the cached
     module directory on ``sys.path`` first resolves the issue.
+
+    Snapshot layout varies by ``huggingface_hub`` version (e.g. legacy
+    ``InstaDeepAI/ntv3_base_model/<rev>/`` vs repo-id folders); fall back
+    to scanning for ``configuration_ntv3_pretrained.py``.
     """
-    pattern = os.path.join(
+    hf_modules = os.path.join(
         os.path.expanduser("~"),
         ".cache", "huggingface", "modules", "transformers_modules",
-        "InstaDeepAI", "ntv3_base_model", "*",
     )
+    pattern = os.path.join(hf_modules, "InstaDeepAI", "ntv3_base_model", "*")
     for d in sorted(glob.glob(pattern), reverse=True):
         if os.path.isdir(d) and d not in sys.path:
             sys.path.insert(0, d)
             return
+    if not os.path.isdir(hf_modules):
+        return
+    candidates: list[str] = []
+    for dirpath, _, filenames in os.walk(hf_modules):
+        if "configuration_ntv3_pretrained.py" in filenames:
+            candidates.append(dirpath)
+    if not candidates:
+        return
+    best = max(
+        candidates,
+        key=lambda p: os.path.getmtime(os.path.join(p, "configuration_ntv3_pretrained.py")),
+    )
+    if best not in sys.path:
+        sys.path.insert(0, best)
 
 NTV3_VARIANTS: dict[str, dict] = {
     "ntv3-8M": {
         "hf_name": "InstaDeepAI/NTv3_8M_pre",
         "layers": 2, "params": "8M", "emb_dim": 256,
         "num_downsamples": 7, "has_special_tokens": False,
-        "stem_only": True,
+        "embed_mode": "first_hidden",
     },
     "ntv3-100M": {
         "hf_name": "InstaDeepAI/NTv3_100M_pre",
         "layers": 6, "params": "100M", "emb_dim": 768,
         "num_downsamples": 7, "has_special_tokens": False,
-        "stem_only": True,
+        "embed_mode": "first_hidden",
     },
     "ntv3-650M": {
         "hf_name": "InstaDeepAI/NTv3_650M_pre",
         "layers": 12, "params": "650M", "emb_dim": 1536,
         "num_downsamples": 7, "has_special_tokens": False,
-        "stem_only": True,
+        "embed_mode": "first_hidden",
     },
 }
 
@@ -75,38 +92,49 @@ NTV3_VARIANTS: dict[str, dict] = {
 class NTv3EmbeddingWrapper(nn.Module):
     """Wraps an NTv3 ``AutoModelForMaskedLM`` to expose ``.last_hidden_state``.
 
-    Two modes are supported:
+    ``embed_mode`` selects how deep into the U-Net embeddings are taken
+    (all return nucleotide resolution ``(B, L, C)`` except notes below):
 
-    ``stem_only=True`` (default, recommended for short sequences):
-        Runs only the learned nucleotide embedding table and the stem
-        Conv1d (kernel=15, 16→768 channels).  Each output position sees
-        ±7 neighbouring nucleotides.  No downsampling, no length
-        constraint.  Output: ``(B, L, emb_dim)``.
+    ``"stem"``:
+        Embedding table + stem Conv1d only (±7 nt receptive field).
+        No length constraint beyond tokenizer limits.
 
-    ``stem_only=False``:
-        Runs the full U-Net forward pass and returns the final deconv
-        hidden state.  Requires sequence length divisible by
-        ``2**num_downsamples`` (128 for standard variants).
-        Output: ``(B, L, emb_dim)``.
+    ``"first_hidden"`` (default):
+        Embed → stem → first conv-tower block (k=5 conv + residual conv),
+        *without* pooling.  Same ``L`` as stem but wider receptive field.
+        No length constraint.
+
+    ``"full"``:
+        Full U-Net and final deconv output (``hidden_states[-1]``).
+        Requires ``L`` divisible by ``2**num_downsamples`` (128 for
+        standard variants).
     """
 
-    def __init__(self, model: nn.Module, stem_only: bool = True):
+    def __init__(self, model: nn.Module, embed_mode: str = "first_hidden"):
         super().__init__()
         self.model = model
-        self.stem_only = stem_only
+        if embed_mode not in ("stem", "first_hidden", "full"):
+            raise ValueError(
+                f"embed_mode must be 'stem', 'first_hidden', or 'full', got {embed_mode!r}"
+            )
+        self.embed_mode = embed_mode
 
     def forward(self, input_ids, attention_mask=None, **kwargs):
-        if self.stem_only:
-            core = self.model.core
+        core = self.model.core
+        if self.embed_mode in ("stem", "first_hidden"):
             x = core.embed_layer(input_ids)          # (B, L, token_embed_dim)
-            x = core.stem(x.permute(0, 2, 1))        # (B, emb_dim, L)
+            x = core.stem(x.permute(0, 2, 1))        # (B, C, L)
+            if self.embed_mode == "stem":
+                return SimpleNamespace(last_hidden_state=x.permute(0, 2, 1).float())
+            block = core.conv_tower_blocks[0]
+            x = block.res_conv(block.conv(x))         # (B, C', L) — no pooling
             return SimpleNamespace(last_hidden_state=x.permute(0, 2, 1).float())
         out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        return SimpleNamespace(last_hidden_state=out.hidden_states[-1])
+        return SimpleNamespace(last_hidden_state=out.hidden_states[-1].float())
 
 
 def load_ntv3_tokenizer(short_name: str):
@@ -120,7 +148,7 @@ def load_ntv3_model(short_name: str, device: str = "cpu",
     _ensure_ntv3_modules_on_path()
     info = NTV3_VARIANTS[short_name]
     hf_name = info["hf_name"]
-    stem_only = info.get("stem_only", True)
+    embed_mode = info.get("embed_mode", "first_hidden")
     model = AutoModelForMaskedLM.from_pretrained(
         hf_name, trust_remote_code=True,
     )
@@ -128,6 +156,6 @@ def load_ntv3_model(short_name: str, device: str = "cpu",
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
-    wrapped = NTv3EmbeddingWrapper(model, stem_only=stem_only)
+    wrapped = NTv3EmbeddingWrapper(model, embed_mode=embed_mode)
     wrapped.eval()
     return wrapped.to(device)

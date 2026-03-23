@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ from biollmcomposition.frameworks.attention import (
     build_model,
 )
 from biollmcomposition.models import get_model_info, load_model
+from biollmcomposition.utils.source_snapshot import log_architecture_sources
 from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
@@ -175,6 +177,9 @@ def main():
         writer.add_text("base_models",
                         f"DNA: {dna_info['hf_name']} ({dna_short})\n"
                         f"Protein: {prot_info['hf_name']} ({prot_short})")
+        log_architecture_sources(
+            writer, importlib.import_module(build_model.__module__),
+            dna_info, prot_info)
 
         model = build_model(dna_lm, prot_lm, dna_info, prot_info, a,
                             device=str(device))
