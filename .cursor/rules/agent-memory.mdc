@@ -1,0 +1,28 @@
+---
+description: Keep project memory and rules up to date after each task
+alwaysApply: true
+---
+
+At the end of every non-trivial task, before giving the final response:
+
+1. Check whether the work changed any durable project knowledge, including:
+   - architecture decisions
+   - new commands/workflows
+   - bug root causes
+   - constraints
+   - naming conventions
+   - file locations
+   - gotchas
+   - follow-up rules
+
+2. If yes, update the appropriate memory file or rule file in this repo, such as:
+   - docs/memory.md
+   - .cursor/rules/project-conventions.mdc
+   - .cursor/rules/workflow-rules.mdc
+
+3. Keep updates short, factual, and deduplicated.
+4. Do not create new memory files unless necessary.
+5. In your final message, state:
+   - whether memory/rules were updated
+   - which file was changed
+   - one-line summary of what was added

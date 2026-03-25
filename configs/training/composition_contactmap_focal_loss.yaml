@@ -9,6 +9,8 @@
 # IMPORTANT: target_layers must be valid for the protein model's layer
 # count.  E.g. for esm2-8M (6 layers) use indices 0..5.
 
+description: ""  # free-text run description — logged to TensorBoard for identification
+
 framework: "composition"
 
 data:
@@ -18,7 +20,7 @@ data:
 
 training:
   lr: 5.0e-5
-  epochs: 100
+  epochs: 50
   batch_size:  16  # reduced from 16 to avoid OOM with ESM2-650M on ~31 GB GPU
   num_workers: 4
   n_runs: 1

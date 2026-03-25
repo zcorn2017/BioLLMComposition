@@ -5,6 +5,8 @@
 # spec, NOT from this config.  This keeps experiments reproducible and
 # prevents mismatches between tokenized data and the model used.
 
+description: ""  # free-text run description — logged to TensorBoard for identification
+
 framework: "attention"
 
 data:

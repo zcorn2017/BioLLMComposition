@@ -5,6 +5,8 @@
 # NOTE: Base model names (DNA / Protein) are read from the data file's
 # spec, NOT from this config.
 
+description: ""  # free-text run description — logged to TensorBoard for identification
+
 framework: "attention"
 
 data:

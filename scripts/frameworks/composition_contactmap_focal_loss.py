@@ -60,6 +60,8 @@ def parse_args():
     p.add_argument("--focal_alpha", type=float, default=None)
     p.add_argument("--focal_gamma", type=float, default=None)
     p.add_argument("--warmup_epochs", type=int, default=None)
+    p.add_argument("--description", type=str, default=None,
+                   help="Free-text run description logged to TensorBoard")
     p.add_argument("--log_dir", type=str, default=None)
     p.add_argument("--save_dir", type=str, default=None)
     return p.parse_args()
@@ -82,6 +84,8 @@ def load_config(args):
     for key in ("focal_alpha", "focal_gamma"):
         if cli.get(key) is not None:
             cfg.setdefault("loss", {})[key] = cli[key]
+    if cli.get("description"):
+        cfg["description"] = cli["description"]
     for key in ("log_dir", "save_dir"):
         if cli.get(key):
             cfg.setdefault("output", {})[key] = cli[key]
@@ -229,10 +233,15 @@ def main():
         print(f"Run {run + 1}/{t.get('n_runs', 1)}  [{run_tag}]")
         print("=" * 60)
 
-        writer = SummaryWriter(f"{o.get('log_dir', './runs')}/{run_tag}/run{run}")
-        writer.add_text("config", str(cfg))
-        writer.add_text("data_spec", str(data_spec))
-        writer.add_text("split_spec", str(split_spec))
+        run_log_dir = f"{o.get('log_dir', './runs')}/{run_tag}/run{run}"
+        writer = SummaryWriter(run_log_dir)
+
+        description = cfg.get("description", "")
+        if description:
+            writer.add_text("description", description)
+        writer.add_text("config", f"```yaml\n{yaml.dump(cfg, default_flow_style=False, sort_keys=False)}\n```")
+        writer.add_text("data_spec", f"```yaml\n{yaml.dump(dict(data_spec), default_flow_style=False, sort_keys=False)}\n```")
+        writer.add_text("split_spec", f"```yaml\n{yaml.dump(dict(split_spec), default_flow_style=False, sort_keys=False)}\n```")
         writer.add_text("base_models",
                         f"DNA: {dna_info['hf_name']} ({dna_short})\n"
                         f"Protein: {prot_info['hf_name']} ({prot_short})")
@@ -272,6 +281,31 @@ def main():
                 best_pr_auc = metrics["pr_auc"]
                 best_metrics = metrics
                 torch.save(model.state_dict(), ckpt_path)
+
+        hparam_dict = {
+            "framework": "composition",
+            "description": cfg.get("description", ""),
+            "dna_model": dna_short,
+            "prot_model": prot_short,
+            "split_strategy": split_spec.get("strategy", ""),
+            "n_train": split_spec.get("n_train", 0),
+            "n_val": split_spec.get("n_val", 0),
+            "lr": t.get("lr", 5e-5),
+            "epochs": epochs,
+            "batch_size": bs,
+            "warmup_epochs": warmup_epochs,
+            "focal_alpha": focal_alpha,
+            "focal_gamma": focal_gamma,
+            "head_dim": a.get("head_dim", 64),
+            "num_heads": a.get("num_heads", 20),
+            "target_layers": str(tl),
+        }
+        metric_dict = {
+            f"hparam/{k}": best_metrics.get(k, 0)
+            for k in ("pr_auc", "roc_auc", "mcc", "precision",
+                       "recall", "f1", "top_L_precision")
+        }
+        writer.add_hparams(hparam_dict, metric_dict, run_name=".")
 
         writer.close()
         print(f"  Best: PR-AUC={best_metrics.get('pr_auc', 0):.4f}, "

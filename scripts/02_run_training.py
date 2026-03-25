@@ -48,7 +48,6 @@ from biollmcomposition.utils.contact_map import (
     masked_bce_loss,
     masked_focal_loss,
     load_split_and_resolve_data,
-    resolve_data_path,
     set_seed,
     subset_data,
 )
@@ -75,6 +74,8 @@ def parse_args():
     p.add_argument("--warmup_epochs", type=int, default=None)
     p.add_argument("--focal_alpha", type=float, default=None)
     p.add_argument("--focal_gamma", type=float, default=None)
+    p.add_argument("--description", type=str, default=None,
+                   help="Free-text run description logged to TensorBoard")
     p.add_argument("--log_dir", type=str, default=None)
     p.add_argument("--save_dir", type=str, default=None)
     return p.parse_args()
@@ -97,6 +98,8 @@ def load_config(args) -> dict:
     for key in ("focal_alpha", "focal_gamma"):
         if cli.get(key) is not None:
             cfg.setdefault("loss", {})[key] = cli[key]
+    if cli.get("description"):
+        cfg["description"] = cli["description"]
     for key in ("log_dir", "save_dir"):
         if cli.get(key):
             cfg.setdefault("output", {})[key] = cli[key]
@@ -159,13 +162,11 @@ def train_one_epoch(model, loader, optimizer, device, loss_fn,
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, loss_fn, _eval_call_count=[0]):
+def evaluate(model, loader, device, loss_fn):
     model.eval()
     all_true, all_score = [], []
     total_loss, n = 0.0, 0
-    _eval_call_count[0] += 1
-    _should_log = _eval_call_count[0] <= 2  # log first 2 eval calls
-    for _bi, batch in enumerate(loader):
+    for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         logits = model(batch)
         total_loss += (
@@ -178,67 +179,9 @@ def evaluate(model, loader, device, loss_fn, _eval_call_count=[0]):
                                batch["prot_mask"], batch["dna_mask"])
         all_true.append(yt)
         all_score.append(ys)
-
-        # #region agent log — H3/H5: check logit and score distribution for first batch
-        if _should_log and _bi == 0:
-            import json as _json, time as _time
-            _LOGPATH = "/home/zcorn/Projects/BioLLMComposition/.cursor/debug-9cd513.log"
-            _probs = torch.sigmoid(logits)
-            _mask = (batch["prot_mask"][:, None, :, None].float()
-                     * batch["dna_mask"][:, :, None, :].float()).bool()
-            _valid_logits = logits[_mask]
-            _valid_probs = _probs[_mask]
-            _valid_labels = batch["Y"][_mask]
-            with open(_LOGPATH, "a") as _f:
-                _f.write(_json.dumps({"sessionId":"9cd513",
-                    "hypothesisId":"H3_H5",
-                    "location":"evaluate:first_batch",
-                    "message":f"logit/score stats (eval call {_eval_call_count[0]})",
-                    "data":{
-                        "batch_size": logits.shape[0],
-                        "logit_shape": list(logits.shape),
-                        "valid_positions": int(_mask.sum()),
-                        "valid_positives": int(_valid_labels.sum()),
-                        "positive_rate": float(_valid_labels.sum() / _mask.sum()) if _mask.sum() > 0 else 0,
-                        "logit_mean": float(_valid_logits.mean()),
-                        "logit_std": float(_valid_logits.std()),
-                        "logit_min": float(_valid_logits.min()),
-                        "logit_max": float(_valid_logits.max()),
-                        "prob_mean": float(_valid_probs.mean()),
-                        "prob_gt_05": int((_valid_probs > 0.5).sum()),
-                        "prob_gt_03": int((_valid_probs > 0.3).sum()),
-                        "prob_gt_01": int((_valid_probs > 0.1).sum()),
-                        "labels_sum_in_batch": float(batch["Y"].sum()),
-                        "yt_len": len(yt), "yt_sum": float(yt.sum()),
-                        "ys_mean": float(ys.mean()), "ys_max": float(ys.max()),
-                    },
-                    "timestamp":int(_time.time()*1000)}) + "\n")
-        # #endregion
-
-    # #region agent log — H5: overall eval metrics before aggregation
-    _all_t = np.concatenate(all_true)
-    _all_s = np.concatenate(all_score)
-    if _should_log:
-        import json as _json, time as _time
-        _LOGPATH = "/home/zcorn/Projects/BioLLMComposition/.cursor/debug-9cd513.log"
-        with open(_LOGPATH, "a") as _f:
-            _f.write(_json.dumps({"sessionId":"9cd513",
-                "hypothesisId":"H5",
-                "location":"evaluate:aggregate",
-                "message":f"full eval stats (eval call {_eval_call_count[0]})",
-                "data":{
-                    "total_valid_positions": len(_all_t),
-                    "total_positives": int(_all_t.sum()),
-                    "positive_rate": float(_all_t.sum() / len(_all_t)) if len(_all_t) > 0 else 0,
-                    "score_mean": float(_all_s.mean()),
-                    "score_std": float(_all_s.std()),
-                    "preds_gt_05": int((_all_s >= 0.5).sum()),
-                    "preds_gt_03": int((_all_s >= 0.3).sum()),
-                },
-                "timestamp":int(_time.time()*1000)}) + "\n")
-    # #endregion
-
-    metrics = compute_contactmap_metrics(_all_t, _all_s)
+    metrics = compute_contactmap_metrics(
+        np.concatenate(all_true), np.concatenate(all_score),
+    )
     metrics["val_loss"] = total_loss / max(n, 1)
     return metrics
 
@@ -369,91 +312,26 @@ def main():
         print(f"LR schedule: warmup={warmup_epochs} epochs ({warmup_steps} steps), "
               f"total={epochs} epochs ({total_steps} steps)")
 
-    # #region agent log — debug instrumentation (data pipeline diagnostics)
-    import json as _json, time as _time
-    _LOGPATH = "/home/zcorn/Projects/BioLLMComposition/.cursor/debug-9cd513.log"
-    def _dlog(hyp, loc, msg, data):
-        with open(_LOGPATH, "a") as _f:
-            _f.write(_json.dumps({"sessionId":"9cd513","hypothesisId":hyp,
-                "location":loc,"message":msg,"data":data,
-                "timestamp":int(_time.time()*1000)}) + "\n")
-
-    # H1/H2/H4: Check mask and label statistics from the dataset
-    _ds = train_loader.dataset
-    _n_check = min(50, len(_ds))
-    _valid_counts, _pos_counts, _total_poss = [], [], []
-    _dna_lens, _cm_shapes = [], []
-    for _i in range(_n_check):
-        _b = _ds[_i]
-        _pm = _b["prot_mask"]   # (R,)
-        _dm = _b["dna_mask"]    # (2, L)
-        _Y = _b["Y"]           # (2, R, L)
-        _mask2d = _pm[None, :, None].float() * _dm[:, None, :].float()  # (2,R,L)
-        _nvalid = _mask2d.sum().item()
-        _npos = (_Y * _mask2d).sum().item()
-        _npos_raw = _Y.sum().item()
-        _valid_counts.append(_nvalid)
-        _pos_counts.append(_npos)
-        _total_poss.append(_npos_raw)
-        _dna_lens.append(_dm[0].sum().item())
-        _cm = _ds.contact_maps[_i]
-        _cm_shapes.append(list(_cm["cm1"].shape))
-    _dlog("H1", "main:data_stats", "mask and label statistics over first N samples", {
-        "n_checked": _n_check,
-        "R": _ds.R, "L": _ds.L,
-        "dna_seq_lens_min_max_mean": [min(_dna_lens), max(_dna_lens), sum(_dna_lens)/len(_dna_lens)],
-        "valid_positions_min_max_mean": [min(_valid_counts), max(_valid_counts), sum(_valid_counts)/len(_valid_counts)],
-        "positives_in_valid_min_max_mean": [min(_pos_counts), max(_pos_counts), sum(_pos_counts)/len(_pos_counts)],
-        "positives_raw_min_max_mean": [min(_total_poss), max(_total_poss), sum(_total_poss)/len(_total_poss)],
-    })
-
-    # H2: Verify contact map alignment — compare raw cm shape vs placed in Y
-    _s0 = _ds[0]
-    _cm0 = _ds.contact_maps[0]
-    _cm1_raw = _cm0["cm1"]
-    _dlog("H2", "main:alignment", "sample 0 alignment check", {
-        "cm1_raw_shape": list(_cm1_raw.shape),
-        "cm1_raw_positives": int(_cm1_raw.sum()),
-        "Y_shape": list(_s0["Y"].shape),
-        "Y_total_positives": float(_s0["Y"].sum()),
-        "Y_strand0_positives": float(_s0["Y"][0].sum()),
-        "prot_mask_sum": float(_s0["prot_mask"].sum()),
-        "dna_mask_strand0_sum": float(_s0["dna_mask"][0].sum()),
-        "dna_off": 0 if not dna_special else 1,
-        "dna_has_special_tokens": dna_special,
-        "first_10_dna1_ids": _ds.dna1_ids[0, :10].tolist(),
-    })
-
-    # H4: Check that mask doesn't accidentally zero out real tokens
-    _am_raw = _ds.dna1_am[0]
-    _ids_raw = _ds.dna1_ids[0]
-    _nonpad_count = (_ids_raw != 1).sum().item()  # NTv3 pad=1
-    _mask_count = _am_raw.sum().item()
-    _dlog("H4", "main:mask_vs_ids", "mask vs raw nonpad token count (sample 0)", {
-        "nonpad_tokens": _nonpad_count,
-        "mask_1s": _mask_count,
-        "match": _nonpad_count == _mask_count,
-        "first_20_ids": _ids_raw[:20].tolist(),
-        "first_20_mask": _am_raw[:20].tolist(),
-    })
-    # #endregion
-
     # ── Training runs ──
     for run in range(n_runs):
         print(f"\n{'=' * 70}")
         print(f"Run {run + 1}/{n_runs}  [{run_tag}]")
         print("=" * 70)
 
-        writer = SummaryWriter(f"{log_dir}/{run_tag}/run{run}")
-        writer.add_text("training_config", str(cfg))
-        writer.add_text("data_spec", str(data_spec))
-        writer.add_text("split_spec", str(split_spec))
+        run_log_dir = f"{log_dir}/{run_tag}/run{run}"
+        writer = SummaryWriter(run_log_dir)
+
+        description = cfg.get("description", "")
+        if description:
+            writer.add_text("description", description)
+        writer.add_text("config", f"```yaml\n{yaml.dump(cfg, default_flow_style=False, sort_keys=False)}\n```")
+        writer.add_text("data_spec", f"```yaml\n{yaml.dump(dict(data_spec), default_flow_style=False, sort_keys=False)}\n```")
+        writer.add_text("split_spec", f"```yaml\n{yaml.dump(dict(split_spec), default_flow_style=False, sort_keys=False)}\n```")
         writer.add_text("base_models",
                         f"DNA: {dna_info['hf_name']} ({dna_short})\n"
                         f"Protein: {prot_info['hf_name']} ({prot_short})")
         writer.add_text("loss", loss_tag)
 
-        # Snapshot source code for full reproducibility
         writer.add_text("source/training_script",
                         f"```python\n{Path(__file__).read_text(encoding='utf-8')}\n```")
         log_architecture_sources(writer, framework, dna_info, prot_info)
@@ -493,6 +371,36 @@ def main():
                 best_pr_auc = metrics["pr_auc"]
                 best_metrics = metrics
                 torch.save(model.state_dict(), ckpt_path)
+
+        hparam_dict = {
+            "framework": framework_name,
+            "description": cfg.get("description", ""),
+            "dna_model": dna_short,
+            "prot_model": prot_short,
+            "split_strategy": split_spec.get("strategy", ""),
+            "n_train": split_spec.get("n_train", 0),
+            "n_val": split_spec.get("n_val", 0),
+            "lr": lr,
+            "epochs": epochs,
+            "batch_size": bs,
+            "warmup_epochs": warmup_epochs,
+            "loss": loss_tag,
+            "head_dim": a.get("head_dim", 64),
+        }
+        if framework_name == "composition":
+            hparam_dict["num_heads"] = a.get("num_heads", 20)
+            hparam_dict["target_layers"] = str(a.get("target_layers", [0, 3, 5]))
+        if "focal_alpha" in loss_cfg:
+            hparam_dict["focal_alpha"] = loss_cfg["focal_alpha"]
+        if "focal_gamma" in loss_cfg:
+            hparam_dict["focal_gamma"] = loss_cfg["focal_gamma"]
+
+        metric_dict = {
+            f"hparam/{k}": best_metrics.get(k, 0)
+            for k in ("pr_auc", "roc_auc", "mcc", "precision",
+                       "recall", "f1", "top_L_precision")
+        }
+        writer.add_hparams(hparam_dict, metric_dict, run_name=".")
 
         writer.close()
         print(
