@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import inspect
 import math
 from functools import partial
 from pathlib import Path
@@ -35,12 +34,14 @@ import torch
 import yaml
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from biollmcomposition.frameworks import get_framework
 from biollmcomposition.models import get_model_info, load_model
-from biollmcomposition.utils.source_snapshot import log_architecture_sources
+from biollmcomposition.utils.wandb_logger import (
+    init_run, log_scalars, log_best_metrics,
+    log_source_artifacts, log_checkpoint, finish,
+)
 from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
@@ -75,7 +76,7 @@ def parse_args():
     p.add_argument("--focal_alpha", type=float, default=None)
     p.add_argument("--focal_gamma", type=float, default=None)
     p.add_argument("--description", type=str, default=None,
-                   help="Free-text run description logged to TensorBoard")
+                   help="Free-text run description logged to W&B")
     p.add_argument("--log_dir", type=str, default=None)
     p.add_argument("--save_dir", type=str, default=None)
     return p.parse_args()
@@ -197,7 +198,7 @@ _FW_SHORT = {
 def build_run_tag(framework_name: str, dna_short: str, prot_short: str,
                   split_spec: dict, training_cfg: dict,
                   arch_cfg: dict, loss_tag: str, timestamp: str) -> str:
-    """Build a descriptive, filesystem-safe TensorBoard run name."""
+    """Build a descriptive, filesystem-safe W&B run name."""
     fw = _FW_SHORT.get(framework_name, framework_name)
     split_tag = split_spec.get("strategy", "unk").replace("_", "")
 
@@ -295,7 +296,6 @@ def main():
 
     save_dir = Path(o.get("save_dir", "./results"))
     save_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = o.get("log_dir", "./runs")
 
     lr = t.get("lr", 5e-5)
     epochs = t.get("epochs", 100)
@@ -318,28 +318,11 @@ def main():
         print(f"Run {run + 1}/{n_runs}  [{run_tag}]")
         print("=" * 70)
 
-        run_log_dir = f"{log_dir}/{run_tag}/run{run}"
-        writer = SummaryWriter(run_log_dir)
-
-        description = cfg.get("description", "")
-        if description:
-            writer.add_text("description", description)
-        writer.add_text("config", f"```yaml\n{yaml.dump(cfg, default_flow_style=False, sort_keys=False)}\n```")
-        writer.add_text("data_spec", f"```yaml\n{yaml.dump(dict(data_spec), default_flow_style=False, sort_keys=False)}\n```")
-        writer.add_text("split_spec", f"```yaml\n{yaml.dump(dict(split_spec), default_flow_style=False, sort_keys=False)}\n```")
-        writer.add_text("base_models",
-                        f"DNA: {dna_info['hf_name']} ({dna_short})\n"
-                        f"Protein: {prot_info['hf_name']} ({prot_short})")
-        writer.add_text("loss", loss_tag)
-
-        writer.add_text("source/training_script",
-                        f"```python\n{Path(__file__).read_text(encoding='utf-8')}\n```")
-        log_architecture_sources(writer, framework, dna_info, prot_info)
-        from biollmcomposition.utils import contact_map as _cm_mod
-        writer.add_text("source/contact_map_utils",
-                        f"```python\n{inspect.getsource(_cm_mod)}\n```")
-        writer.add_text("source/config_yaml",
-                        f"```yaml\n{Path(args.config).read_text(encoding='utf-8')}\n```")
+        init_run(cfg, run_tag, run, framework_name,
+                 dna_short=dna_short, prot_short=prot_short,
+                 loss_tag=loss_tag)
+        log_source_artifacts(framework, dna_info, prot_info,
+                             __file__, args.config)
 
         model = framework.build_model(
             dna_lm, prot_lm, dna_info, prot_info, a, device=str(device),
@@ -359,50 +342,17 @@ def main():
                                          device, loss_fn, scheduler)
             metrics = evaluate(model, val_loader, device, loss_fn)
 
-            writer.add_scalar("loss/train", train_loss, epoch)
-            writer.add_scalar("loss/val", metrics["val_loss"], epoch)
-            if scheduler is not None:
-                writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
-            for k, v in metrics.items():
-                if k != "val_loss":
-                    writer.add_scalar(f"metric/{k}", v, epoch)
+            cur_lr = optimizer.param_groups[0]["lr"] if scheduler else None
+            log_scalars(epoch, train_loss, metrics, lr=cur_lr)
 
             if metrics["pr_auc"] > best_pr_auc:
                 best_pr_auc = metrics["pr_auc"]
                 best_metrics = metrics
                 torch.save(model.state_dict(), ckpt_path)
 
-        hparam_dict = {
-            "framework": framework_name,
-            "description": cfg.get("description", ""),
-            "dna_model": dna_short,
-            "prot_model": prot_short,
-            "split_strategy": split_spec.get("strategy", ""),
-            "n_train": split_spec.get("n_train", 0),
-            "n_val": split_spec.get("n_val", 0),
-            "lr": lr,
-            "epochs": epochs,
-            "batch_size": bs,
-            "warmup_epochs": warmup_epochs,
-            "loss": loss_tag,
-            "head_dim": a.get("head_dim", 64),
-        }
-        if framework_name == "composition":
-            hparam_dict["num_heads"] = a.get("num_heads", 20)
-            hparam_dict["target_layers"] = str(a.get("target_layers", [0, 3, 5]))
-        if "focal_alpha" in loss_cfg:
-            hparam_dict["focal_alpha"] = loss_cfg["focal_alpha"]
-        if "focal_gamma" in loss_cfg:
-            hparam_dict["focal_gamma"] = loss_cfg["focal_gamma"]
-
-        metric_dict = {
-            f"hparam/{k}": best_metrics.get(k, 0)
-            for k in ("pr_auc", "roc_auc", "mcc", "precision",
-                       "recall", "f1", "top_L_precision")
-        }
-        writer.add_hparams(hparam_dict, metric_dict, run_name=".")
-
-        writer.close()
+        log_best_metrics(best_metrics)
+        log_checkpoint(ckpt_path)
+        finish()
         print(
             f"  Best: PR-AUC={best_metrics.get('pr_auc', 0):.4f}, "
             f"ROC-AUC={best_metrics.get('roc_auc', 0):.4f}, "

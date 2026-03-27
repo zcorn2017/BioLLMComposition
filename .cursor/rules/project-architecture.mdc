@@ -29,11 +29,13 @@ biollmcomposition/
     composition.py       # LM-interleaved: DNA injected into ESM2 layers via cross-attn
   utils/
     contact_map.py       # Losses, metrics, dataset, masks, splitting helpers
+    wandb_logger.py      # W&B experiment tracking helpers
 
 scripts/
   00_precompute_tokens_and_labels.py   # Raw data → tokenized .pt
   01_split_datasets.py                 # .pt → train/val/test split indices
   02_run_training.py                   # Unified config-driven training (BCE loss)
+  hpo_focal_loss.py                    # Optuna HPO for focal loss parameters
   frameworks/
     attention_contactmap.py            # Standalone attention trainer (BCE)
     composition_contactmap.py          # Standalone composition trainer (BCE)
@@ -135,7 +137,7 @@ With plain BCE, the gradient was dominated by negatives → model predicted
 Differences from BCE versions:
 1. Uses `masked_focal_loss` instead of `masked_bce_loss`
 2. Adds **linear warmup + cosine decay** LR scheduler (per-step, not per-epoch)
-3. Logs `lr` scalar to TensorBoard
+3. Logs `lr` scalar to W&B
 4. Config has `loss:` section (`focal_alpha`, `focal_gamma`) and `warmup_epochs`
 
 ### LR Schedule
@@ -193,7 +195,60 @@ python scripts/02_run_training.py \
 
 `compute_contactmap_metrics()` returns: `pr_auc`, `roc_auc`, `mcc`,
 `precision`, `recall`, `f1`, `top_L_precision`. Default threshold = 0.5.
-Best model selected by `pr_auc`. All metrics logged to TensorBoard.
+Best model selected by `pr_auc`. All metrics logged to W&B.
+
+## Experiment Tracking (W&B)
+
+All training scripts use `biollmcomposition/utils/wandb_logger.py` for
+experiment tracking via Weights & Biases.
+
+- **Project**: `BioLLMComposition`
+- **Group**: framework name (`attention` / `composition`)
+- **Tags**: `[framework, loss_type, dna_model, prot_model]`
+
+### Offline mode (biocluster)
+
+Biocluster compute nodes have no internet.  `slurm/train.sbatch` sets
+`WANDB_MODE=offline`, which writes runs to `wandb/offline-run-*`.
+After pulling results back, upload via:
+
+```bash
+make wandb-sync             # pulls results then runs wandb sync
+```
+
+`zcorn-compute` has internet access and uploads to W&B directly.
+
+### HPO (Optuna + SLURM arrays)
+
+`scripts/hpo_focal_loss.py` wraps existing focal-loss training scripts
+via subprocess and tunes `focal_alpha`, `focal_gamma`, `lr`, and
+`warmup_epochs` using Optuna.
+
+Uses `JournalFileStorage` (NFS-safe, no SQLite locking issues).
+Auto-detects SLURM array env vars (`SLURM_ARRAY_TASK_COUNT`,
+`SLURM_ARRAY_TASK_ID`) to split trials across workers.
+
+```bash
+# Parallel: 40 trials across 8 GPUs on biocluster
+make submit-hpo ARRAY=8 EXTRA="--n_trials 40 --epochs 30"
+
+# Sequential: single GPU locally or on zcorn-compute
+make run-local JOB=hpo_focal EXTRA="--n_trials 40 --epochs 30"
+make submit JOB=hpo_focal TARGET=compute EXTRA="--n_trials 40 --epochs 30"
+
+# Resume interrupted study (just resubmit)
+make submit-hpo ARRAY=8 EXTRA="--n_trials 20 --epochs 30"
+```
+
+### Makefile targets
+
+| Target | Description |
+|--------|-------------|
+| `run-local` | Run a job locally (RTX 5090) |
+| `wandb-sync` | Pull offline W&B runs + upload them |
+| `submit` | Submit SLURM job on biocluster/compute |
+| `submit-hpo` | Submit parallel HPO array on SLURM |
+| `pull` | Fetch results + wandb/ + logs from remote |
 
 ## Key Design Decisions
 

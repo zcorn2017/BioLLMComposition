@@ -40,8 +40,8 @@ REMOTE_DEST      := $(REMOTE):$(REMOTE_PROJECT)
 REMOTE_DATA_DEST := $(REMOTE):$(REMOTE_DATA)
 JOBS_CONF        := slurm/jobs.conf
 
-.PHONY: help push push-data pull setup setup-env submit submit-all \
-        status logs cancel ssh clean-logs
+.PHONY: help push push-data pull setup setup-env submit submit-all submit-hpo \
+        status logs cancel ssh clean-logs run-local wandb-sync
 
 help: ## Show this help
 	@echo "TARGET=$(TARGET)  ($(REMOTE_HOST))"
@@ -57,6 +57,7 @@ push: ## Rsync code to remote (excludes data, results, runs)
 		--exclude='.git/' \
 		--exclude='runs/' \
 		--exclude='results/' \
+		--exclude='wandb/' \
 		--exclude='archive/' \
 		--exclude='.cursor/' \
 		--exclude='slurm/logs/' \
@@ -73,9 +74,9 @@ push-data: ## Rsync only embeddings/ and split_dataset/
 	@echo "── Data sync complete ──"
 
 # ── Fetch results ────────────────────────────────────────────────────────
-pull: ## Rsync results + runs from remote back to local
+pull: ## Rsync results + wandb runs from remote back to local
 	@echo "── [$(TARGET)] Pulling results from $(REMOTE_DEST) ──"
-	rsync -avzP --include='results/***' --include='runs/***' --include='slurm/logs/***' --exclude='*' $(REMOTE_DEST)/ ./
+	rsync -avzP --include='results/***' --include='wandb/***' --include='slurm/logs/***' --exclude='*' $(REMOTE_DEST)/ ./
 	@echo "── Results sync complete ──"
 
 # ── First-time setup ────────────────────────────────────────────────────
@@ -105,6 +106,35 @@ submit-all: ## Submit all jobs defined in slurm/jobs.conf
 		config=$$(echo "$$rest" | cut -d'|' -f2); \
 		ssh $(REMOTE) "cd $(REMOTE_PROJECT) && mkdir -p slurm/logs && sbatch --job-name=biollm-$$name $(SBATCH_SCRIPT) $$script $$config"; \
 	done < $(JOBS_CONF)
+
+ARRAY ?= 8
+HPO_CONFIG ?= configs/training/composition_contactmap_focal_loss.yaml
+
+submit-hpo: ## Submit parallel HPO: make submit-hpo ARRAY=8 [EXTRA="--n_trials 40 --epochs 30"]
+	@echo "── [$(TARGET)] Submitting HPO array ($(ARRAY) workers) ──"
+	ssh $(REMOTE) 'cd $(REMOTE_PROJECT) && mkdir -p slurm/logs && sbatch --array=0-$$(($(ARRAY)-1)) --job-name=biollm-hpo $(SBATCH_SCRIPT) scripts/hpo_focal_loss.py $(HPO_CONFIG) $(EXTRA)'
+
+# ── Local execution ─────────────────────────────────────────────────────
+run-local: ## Run a job locally: make run-local JOB=attention_focal [EXTRA="--lr 1e-4"]
+ifndef JOB
+	$(error JOB is required. Available jobs: $$(cut -d= -f1 $(JOBS_CONF) | tr '\n' ' '))
+endif
+	$(eval ENTRY := $(shell grep '^$(JOB)=' $(JOBS_CONF)))
+	$(if $(ENTRY),,$(error Unknown JOB '$(JOB)'. Available: $$(cut -d= -f1 $(JOBS_CONF) | tr '\n' ' ')))
+	$(eval SCRIPT := $(word 1,$(subst |, ,$(lastword $(subst =, ,$(ENTRY))))))
+	$(eval CONFIG := $(word 2,$(subst |, ,$(lastword $(subst =, ,$(ENTRY))))))
+	@echo "── Running $(JOB) locally: $(SCRIPT) + $(CONFIG) ──"
+	python -u $(SCRIPT) --config $(CONFIG) $(EXTRA)
+
+# ── W&B sync ───────────────────────────────────────────────────────────
+wandb-sync: pull ## Pull offline W&B runs then upload them
+	@echo "── Syncing W&B offline runs ──"
+	@for d in wandb/offline-run-*; do \
+		[ -d "$$d" ] || continue; \
+		echo "  syncing $$d"; \
+		wandb sync "$$d"; \
+	done
+	@echo "── W&B sync complete ──"
 
 # ── Monitoring ──────────────────────────────────────────────────────────
 status: ## Check SLURM queue on remote

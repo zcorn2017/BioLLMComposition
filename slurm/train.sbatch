@@ -24,14 +24,14 @@ echo "Extra:     $*"
 echo "Start:     $(date)"
 echo "=================================================="
 
-module load Miniconda3
-eval "$(conda shell.bash hook)"
-conda activate py314-llm
+# Use direct PATH to conda env — avoids Lmod dependency issues in array jobs.
+export PATH="$HOME/.conda/envs/py314-llm/bin:$PATH"
 
 export DATA_ROOT="$HOME/Projects/proteinDNA_data"
 # Compute nodes have no HF egress; models must already be in ~/.cache/huggingface (see slurm/setup_env*.sh).
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_OFFLINE=1
+export WANDB_MODE=offline
 
 nvidia-smi
 

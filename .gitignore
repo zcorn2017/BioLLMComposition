@@ -12,6 +12,8 @@ __pycache__/
 *.pth
 runs/
 results/
+wandb/
+*.db
 
 slurm/logs/*.out
 slurm/logs/*.err

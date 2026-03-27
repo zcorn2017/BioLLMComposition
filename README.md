@@ -66,3 +66,53 @@ diff: comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl253034_f
 
 comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl0510_focal_a0.95_g2.0_20260319_122013 vs 
 runs/comp_cm_ntv3-100M_esmc-600M_groupshuffle_lr5e-05_bs16_hd64_nh16_tl253034_focal_a0.95_g2.0_20260320_004337 changed injected layers tl0510 to tl253034
+
+
+
+Local (RTX 5090)
+# Single experiment
+make run-local JOB=composition_focal
+make run-local JOB=composition_focal EXTRA="--focal_alpha 0.9 --focal_gamma 3.0"
+make run-local JOB=attention_focal EXTRA="--lr 1e-4 --epochs 100"
+# All available JOBs: attention_bce, attention_focal, composition_bce, composition_focal
+Runs directly via python -u. ClearML env vars are injected inline. Results appear in the web UI immediately.
+
+Biocluster (default TARGET)
+# First-time setup (once)
+make setup                          # pushes code + data + creates conda env
+# Before each batch of experiments
+make push                           # sync latest code
+# Submit
+make submit JOB=composition_focal
+make submit JOB=composition_focal EXTRA="--focal_alpha 0.9 --focal_gamma 3.0"
+make submit JOB=attention_focal
+# Monitor
+make status                          # SLURM queue
+make logs                            # list recent log files
+make logs JOB_ID=12345               # tail specific job's output
+# Retrieve checkpoints (optional -- also in ClearML)
+make pull
+# Cancel
+make cancel JOB_ID=12345
+zcorn-compute
+Same commands, add TARGET=compute:
+
+make push TARGET=compute
+make submit JOB=composition_focal TARGET=compute
+make submit JOB=composition_focal TARGET=compute EXTRA="--focal_alpha 0.9"
+make status TARGET=compute
+make logs TARGET=compute
+make pull TARGET=compute
+Sweep (all targets)
+# Focal loss grid search via the existing sweep script
+bash slurm/sweep-focal-loss.sh                    # biocluster (default)
+TARGET=compute bash slurm/sweep-focal-loss.sh      # zcorn-compute
+bash slurm/sweep-focal-loss.sh --dry-run           # preview without submitting
+ClearML server management
+make server-status     # check containers
+make server-logs       # tail API logs
+make server-stop       # stop server
+make server-start      # restart server
+Web UI
+Browse all experiments (from any machine) at: http://yumingz5-linux.scs.illinois.edu:9080
+

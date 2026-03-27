@@ -23,7 +23,6 @@ import torch
 import yaml
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from biollmcomposition.frameworks.attention import (
@@ -31,7 +30,10 @@ from biollmcomposition.frameworks.attention import (
     build_model,
 )
 from biollmcomposition.models import get_model_info, load_model
-from biollmcomposition.utils.source_snapshot import log_architecture_sources
+from biollmcomposition.utils.wandb_logger import (
+    init_run, log_scalars, log_best_metrics,
+    log_source_artifacts, log_checkpoint, finish,
+)
 from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
@@ -60,7 +62,7 @@ def parse_args():
     p.add_argument("--focal_gamma", type=float, default=None)
     p.add_argument("--warmup_epochs", type=int, default=None)
     p.add_argument("--description", type=str, default=None,
-                   help="Free-text run description logged to TensorBoard")
+                   help="Free-text run description logged to W&B")
     p.add_argument("--log_dir", type=str, default=None)
     p.add_argument("--save_dir", type=str, default=None)
     return p.parse_args()
@@ -228,23 +230,12 @@ def main():
         print(f"Run {run + 1}/{t.get('n_runs', 1)}  [{run_tag}]")
         print("=" * 60)
 
-        run_log_dir = f"{o.get('log_dir', './runs')}/{run_tag}/run{run}"
-        writer = SummaryWriter(run_log_dir)
-
-        description = cfg.get("description", "")
-        if description:
-            writer.add_text("description", description)
-        writer.add_text("config", f"```yaml\n{yaml.dump(cfg, default_flow_style=False, sort_keys=False)}\n```")
-        writer.add_text("data_spec", f"```yaml\n{yaml.dump(dict(data_spec), default_flow_style=False, sort_keys=False)}\n```")
-        writer.add_text("split_spec", f"```yaml\n{yaml.dump(dict(split_spec), default_flow_style=False, sort_keys=False)}\n```")
-        writer.add_text("base_models",
-                        f"DNA: {dna_info['hf_name']} ({dna_short})\n"
-                        f"Protein: {prot_info['hf_name']} ({prot_short})")
-        writer.add_text("loss",
-                        f"Focal loss: alpha={focal_alpha}, gamma={focal_gamma}")
-        log_architecture_sources(
-            writer, importlib.import_module(build_model.__module__),
-            dna_info, prot_info)
+        loss_tag = f"focal_a{focal_alpha}_g{focal_gamma}"
+        init_run(cfg, run_tag, run, "attention",
+                 dna_short=dna_short, prot_short=prot_short,
+                 loss_tag=loss_tag)
+        log_source_artifacts(importlib.import_module(build_model.__module__),
+                             dna_info, prot_info, __file__, args.config)
 
         model = build_model(dna_lm, prot_lm, dna_info, prot_info, a,
                             device=str(device))
@@ -266,41 +257,15 @@ def main():
                                focal_alpha, focal_gamma)
 
             cur_lr = optimizer.param_groups[0]["lr"]
-            writer.add_scalar("loss/train", train_loss, epoch)
-            writer.add_scalar("loss/val", metrics["val_loss"], epoch)
-            writer.add_scalar("lr", cur_lr, epoch)
-            for k, v in metrics.items():
-                if k != "val_loss":
-                    writer.add_scalar(f"metric/{k}", v, epoch)
+            log_scalars(epoch, train_loss, metrics, lr=cur_lr)
             if metrics["pr_auc"] > best_pr_auc:
                 best_pr_auc = metrics["pr_auc"]
                 best_metrics = metrics
                 torch.save(model.state_dict(), ckpt_path)
 
-        hparam_dict = {
-            "framework": "attention",
-            "description": cfg.get("description", ""),
-            "dna_model": dna_short,
-            "prot_model": prot_short,
-            "split_strategy": split_spec.get("strategy", ""),
-            "n_train": split_spec.get("n_train", 0),
-            "n_val": split_spec.get("n_val", 0),
-            "lr": t.get("lr", 5e-5),
-            "epochs": epochs,
-            "batch_size": bs,
-            "warmup_epochs": warmup_epochs,
-            "focal_alpha": focal_alpha,
-            "focal_gamma": focal_gamma,
-            "head_dim": a.get("head_dim", 64),
-        }
-        metric_dict = {
-            f"hparam/{k}": best_metrics.get(k, 0)
-            for k in ("pr_auc", "roc_auc", "mcc", "precision",
-                       "recall", "f1", "top_L_precision")
-        }
-        writer.add_hparams(hparam_dict, metric_dict, run_name=".")
-
-        writer.close()
+        log_best_metrics(best_metrics)
+        log_checkpoint(ckpt_path)
+        finish()
         print(f"  Best: PR-AUC={best_metrics.get('pr_auc', 0):.4f}, "
               f"ROC-AUC={best_metrics.get('roc_auc', 0):.4f}, "
               f"MCC={best_metrics.get('mcc', 0):.4f}, "

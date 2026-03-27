@@ -107,12 +107,12 @@ dependencies:
       - six==1.17.0
       - stack-data==0.6.3
       - sympy==1.14.0
-      - tensorboard==2.20.0
-      - tensorboard-data-server==0.7.2
+      - optuna==4.3.0
+      - optuna-integration==4.3.0
+      - wandb==0.19.11
       - threadpoolctl==3.6.0
       - tokenizers==0.21.4
       - torch==2.9.1+cu130
-      - torch-tb-profiler==0.4.3
       - torchvision==0.24.1+cu130
       - tornado==6.5.3
       - tqdm==4.67.1

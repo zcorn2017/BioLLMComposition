@@ -16,7 +16,6 @@ import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from biollmcomposition.frameworks.attention import (
@@ -24,7 +23,10 @@ from biollmcomposition.frameworks.attention import (
     build_model,
 )
 from biollmcomposition.models import get_model_info, load_model
-from biollmcomposition.utils.source_snapshot import log_architecture_sources
+from biollmcomposition.utils.wandb_logger import (
+    init_run, log_scalars, log_best_metrics,
+    log_source_artifacts, log_checkpoint, finish,
+)
 from biollmcomposition.utils.contact_map import (
     ContactMapDataset,
     compute_contactmap_metrics,
@@ -170,16 +172,10 @@ def main():
         print(f"Run {run + 1}/{t.get('n_runs', 1)}  [{run_tag}]")
         print("=" * 60)
 
-        writer = SummaryWriter(f"{o.get('log_dir', './runs')}/{run_tag}/run{run}")
-        writer.add_text("config", str(cfg))
-        writer.add_text("data_spec", str(data_spec))
-        writer.add_text("split_spec", str(split_spec))
-        writer.add_text("base_models",
-                        f"DNA: {dna_info['hf_name']} ({dna_short})\n"
-                        f"Protein: {prot_info['hf_name']} ({prot_short})")
-        log_architecture_sources(
-            writer, importlib.import_module(build_model.__module__),
-            dna_info, prot_info)
+        init_run(cfg, run_tag, run, "attention",
+                 dna_short=dna_short, prot_short=prot_short, loss_tag="bce")
+        log_source_artifacts(importlib.import_module(build_model.__module__),
+                             dna_info, prot_info, __file__, args.config)
 
         model = build_model(dna_lm, prot_lm, dna_info, prot_info, a,
                             device=str(device))
@@ -195,17 +191,15 @@ def main():
         for epoch in tqdm(range(t.get("epochs", 100)), desc=f"Run {run}"):
             train_loss = train_one_epoch(model, train_loader, optimizer, device)
             metrics = evaluate(model, val_loader, device)
-            writer.add_scalar("loss/train", train_loss, epoch)
-            writer.add_scalar("loss/val", metrics["val_loss"], epoch)
-            for k, v in metrics.items():
-                if k != "val_loss":
-                    writer.add_scalar(f"metric/{k}", v, epoch)
+            log_scalars(epoch, train_loss, metrics)
             if metrics["pr_auc"] > best_pr_auc:
                 best_pr_auc = metrics["pr_auc"]
                 best_metrics = metrics
                 torch.save(model.state_dict(), ckpt_path)
 
-        writer.close()
+        log_best_metrics(best_metrics)
+        log_checkpoint(ckpt_path)
+        finish()
         print(f"  Best: PR-AUC={best_metrics.get('pr_auc', 0):.4f}, "
               f"ROC-AUC={best_metrics.get('roc_auc', 0):.4f}, "
               f"MCC={best_metrics.get('mcc', 0):.4f}, "
