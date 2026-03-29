@@ -1,0 +1,44 @@
+# -- Composition contact-map v2: dynamic batching + refined head ----------------
+# Usage:  python scripts/frameworks/composition_contactmap_v2.py \
+#             --config configs/training/composition_contactmap_v2.yaml
+#
+# Defaults use best focal-loss sweep result (alpha=0.8, gamma=1.0) and
+# enable dynamic batching to reduce the ~33x padding overhead.
+
+description: ""
+
+framework: "composition"
+
+data:
+  split_pt: "/home/zcorn/Projects/proteinDNA_data/processed/split_dataset/split_group_shuffle_pdb_id_s42_80-10-10_20260319_121910.pt"
+
+training:
+  lr: 5.0e-5
+  epochs: 50
+  batch_size: 16
+  num_workers: 4
+  n_runs: 1
+  seed: 42
+  warmup_epochs: 5
+
+loss:
+  focal_alpha: 0.8
+  focal_gamma: 1.0
+
+architecture:
+  head_dim: 64
+  num_heads: 16
+  target_layers: [25, 30, 34]
+  gradient_checkpointing: false
+  contact_head: "bilinear"       # "bilinear" (baseline) or "refined" (2D conv)
+  refine_channels: 32            # only used when contact_head: "refined"
+
+data_loading:
+  dynamic_batching: true          # bucket samples by length, pad to batch-local max
+  bucket_size_multiplier: 10      # bucket width = batch_size * this
+  positive_enrichment: false      # ensure min positive contacts per batch
+  min_positive_fraction: 0.5      # fraction of batch from high-contact samples
+
+output:
+  log_dir:  "./runs"
+  save_dir: "./results"

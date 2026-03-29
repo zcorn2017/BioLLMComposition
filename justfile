@@ -27,3 +27,10 @@ split config=split_config data_pt='':
 train config=train_config split_pt='':
     {{py}} scripts/02_run_training.py --config {{config}} \
         $(shell [ -n '{{split_pt}}' ] && echo '--split_pt' '{{split_pt}}')
+
+run:
+    python scripts/frameworks/composition_contactmap_v2.py \
+    --config configs/training/composition_contactmap_v2.yaml \
+    --contact_head refined --dynamic_batching
+    python scripts/frameworks/composition_contactmap_v2.py \
+    --config configs/training/composition_contactmap_v2.yaml

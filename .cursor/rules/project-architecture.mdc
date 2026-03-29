@@ -28,7 +28,8 @@ biollmcomposition/
     attention.py         # Cross-attention: prot queries each DNA strand separately
     composition.py       # LM-interleaved: DNA injected into ESM2 layers via cross-attn
   utils/
-    contact_map.py       # Losses, metrics, dataset, masks, splitting helpers
+    contact_map.py       # Losses, metrics, dataset, masks, splitting helpers,
+                         # dynamic batching (BucketBatchSampler, VariableLengthContactMapDataset)
     wandb_logger.py      # W&B experiment tracking helpers
 
 scripts/
@@ -36,11 +37,14 @@ scripts/
   01_split_datasets.py                 # .pt → train/val/test split indices
   02_run_training.py                   # Unified config-driven training (BCE loss)
   hpo_focal_loss.py                    # Optuna HPO for focal loss parameters
+  analysis/
+    attention_diagnostics.py           # Post-training diagnostics (attention, calibration)
   frameworks/
     attention_contactmap.py            # Standalone attention trainer (BCE)
     composition_contactmap.py          # Standalone composition trainer (BCE)
     attention_contactmap_focal_loss.py # Attention + focal loss + LR schedule
     composition_contactmap_focal_loss.py # Composition + focal loss + LR schedule
+    composition_contactmap_v2.py       # v2: dynamic batching + refined head + enrichment
 
 configs/
   precompute/        # YAML for 00_precompute
@@ -107,6 +111,17 @@ model = load_model("esm2-3B", device="cuda")  # frozen, eval mode
 - Config: `target_layers`, `num_heads`
 
 Both output `(B, 2, R, L)` logits via `ContactMapHead` (bilinear dot product).
+
+### Contact head variants
+- **`ContactMapHead`** (default): bilinear `prot_proj[r] · dna_proj[l]`
+- **`RefinedContactMapHead`**: bilinear + residual 2D conv refinement (3 layers).
+  Select via `architecture.contact_head: "refined"` in config.
+
+### Dynamic batching (`contact_map.py`)
+- **`VariableLengthContactMapDataset`**: returns unpadded samples (actual seq lengths)
+- **`collate_contactmap_batch()`**: pads to batch-local max instead of global max
+- **`BucketBatchSampler`**: groups similar-length sequences; supports positive-enriched batching
+- Reduces average padding overhead from ~33x to ~2-5x
 
 ## Loss Functions (`biollmcomposition/utils/contact_map.py`)
 
@@ -189,6 +204,21 @@ python scripts/frameworks/composition_contactmap_focal_loss.py \
 # Original BCE (no focal loss, no scheduler)
 python scripts/02_run_training.py \
     --config configs/training/composition_contactmap.yaml
+
+# v2: dynamic batching + optional refined head
+python scripts/frameworks/composition_contactmap_v2.py \
+    --config configs/training/composition_contactmap_v2.yaml
+
+# v2 with refined head and positive enrichment
+python scripts/frameworks/composition_contactmap_v2.py \
+    --config configs/training/composition_contactmap_v2.yaml \
+    --contact_head refined --dynamic_batching
+
+# Post-training diagnostics
+python scripts/analysis/attention_diagnostics.py \
+    --config configs/training/composition_contactmap_v2.yaml \
+    --checkpoint results/my_model_best.pth \
+    --output_dir analysis_output/
 ```
 
 ## Evaluation Metrics
@@ -218,6 +248,12 @@ make wandb-sync             # pulls results then runs wandb sync
 
 `zcorn-compute` has internet access and uploads to W&B directly.
 
+**`TARGET=testgpu`** (IGB `gputest.igb.illinois.edu`, user `yumingz5`, SSH Host `testgpu`): same
+push/pull/push-data/setup as compute, but **no SLURM** — `make submit` runs
+`slurm/run-remote-train.sh` under `nohup` and logs to `slurm/logs/`. Setup uses
+`slurm/setup_env_noslurm.sh` (conda in `$HOME` or `CONDA_EXE`, no root). `submit-hpo`
+is single-process (ARRAY ignored); `submit-all` is disallowed for this target.
+
 ### HPO (Optuna + SLURM arrays)
 
 `scripts/hpo_focal_loss.py` wraps existing focal-loss training scripts
@@ -236,6 +272,9 @@ make submit-hpo ARRAY=8 EXTRA="--n_trials 40 --epochs 30"
 make run-local JOB=hpo_focal EXTRA="--n_trials 40 --epochs 30"
 make submit JOB=hpo_focal TARGET=compute EXTRA="--n_trials 40 --epochs 30"
 
+# Single GPU, no SLURM (testgpu)
+make submit-hpo TARGET=testgpu EXTRA="--n_trials 40 --epochs 30"
+
 # Resume interrupted study (just resubmit)
 make submit-hpo ARRAY=8 EXTRA="--n_trials 20 --epochs 30"
 ```
@@ -246,8 +285,8 @@ make submit-hpo ARRAY=8 EXTRA="--n_trials 20 --epochs 30"
 |--------|-------------|
 | `run-local` | Run a job locally (RTX 5090) |
 | `wandb-sync` | Pull offline W&B runs + upload them |
-| `submit` | Submit SLURM job on biocluster/compute |
-| `submit-hpo` | Submit parallel HPO array on SLURM |
+| `submit` | SLURM job on biocluster/compute, or `nohup` on `TARGET=testgpu` |
+| `submit-hpo` | Parallel HPO array on SLURM; single process on `TARGET=testgpu` |
 | `pull` | Fetch results + wandb/ + logs from remote |
 
 ## Key Design Decisions

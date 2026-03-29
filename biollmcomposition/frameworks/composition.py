@@ -104,6 +104,30 @@ class ContactMapHead(nn.Module):
         )
 
 
+class RefinedContactMapHead(nn.Module):
+    """Bilinear scores followed by 2D conv refinement.
+
+    Captures local spatial patterns (e.g. contiguous contact runs) that
+    the position-independent bilinear head cannot model.
+    """
+
+    def __init__(self, prot_dim: int, dna_dim: int, head_dim: int = 64,
+                 refine_channels: int = 32):
+        super().__init__()
+        self.bilinear = ContactMapHead(prot_dim, dna_dim, head_dim)
+        self.refine = nn.Sequential(
+            nn.Conv2d(1, refine_channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refine_channels, refine_channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refine_channels, 1, 1),
+        )
+
+    def forward(self, prot_h, dna_h):
+        raw = self.bilinear(prot_h, dna_h)
+        return raw + self.refine(raw.unsqueeze(1)).squeeze(1)
+
+
 class CompositionContactMapModel(nn.Module):
     """Composition of LMs with per-residue contact-map output.
 
@@ -119,7 +143,8 @@ class CompositionContactMapModel(nn.Module):
                  target_layers: list[int] | None = None,
                  esm_layers: int = 6,
                  prot_family: str = "esm2",
-                 gradient_checkpointing: bool = False):
+                 gradient_checkpointing: bool = False,
+                 contact_head: nn.Module | None = None):
         super().__init__()
         self.dna_lm = dna_lm
         self.prot_lm = prot_lm
@@ -143,8 +168,9 @@ class CompositionContactMapModel(nn.Module):
         self.post_attn_norms = nn.ModuleList([
             nn.LayerNorm(prot_emb_dim) for _ in self.target_layers
         ])
-        self.contact_head = ContactMapHead(prot_emb_dim, prot_emb_dim,
-                                           head_dim)
+        self.contact_head = contact_head or ContactMapHead(
+            prot_emb_dim, prot_emb_dim, head_dim,
+        )
 
         for p in self.dna_lm.parameters():
             p.requires_grad = False
@@ -243,14 +269,25 @@ def build_model(dna_lm, prot_lm, dna_info: dict, prot_info: dict,
             f"e.g. num_heads={compatible}."
         )
 
+    head_dim = arch_cfg.get("head_dim", 64)
+    contact_head_type = arch_cfg.get("contact_head", "bilinear")
+    if contact_head_type == "refined":
+        refine_channels = arch_cfg.get("refine_channels", 32)
+        contact_head = RefinedContactMapHead(
+            prot_emb_dim, prot_emb_dim, head_dim, refine_channels,
+        )
+    else:
+        contact_head = ContactMapHead(prot_emb_dim, prot_emb_dim, head_dim)
+
     return CompositionContactMapModel(
         dna_lm, prot_lm,
         dna_emb_dim=dna_info["emb_dim"],
         prot_emb_dim=prot_emb_dim,
         num_heads=num_heads,
-        head_dim=arch_cfg.get("head_dim", 64),
+        head_dim=head_dim,
         target_layers=target_layers,
         esm_layers=esm_layers,
         prot_family=prot_family,
         gradient_checkpointing=arch_cfg.get("gradient_checkpointing", False),
+        contact_head=contact_head,
     ).to(device)

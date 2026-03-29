@@ -3,12 +3,14 @@
 # Usage (TARGET defaults to "cluster"):
 #   make push                          # push code to biocluster
 #   make push TARGET=compute           # push code to zcorn-compute
+#   make push TARGET=testgpu           # IGB gputest (yumingz5), no SLURM
 #   make submit JOB=attention_focal    # submit on biocluster
 #   make submit JOB=attention_focal TARGET=compute
+#   make submit JOB=composition_focal TARGET=testgpu   # nohup on remote GPU
 #   make pull TARGET=compute
 #   make setup TARGET=compute
 #
-# Targets: cluster (biocluster), compute (zcorn-compute)
+# Targets: cluster (biocluster), compute (zcorn-compute + SLURM), testgpu (gputest, no SLURM)
 #
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -23,6 +25,7 @@ ifeq ($(TARGET),cluster)
   REMOTE_DATA    := ~/Projects/proteinDNA_data
   SBATCH_SCRIPT  := slurm/train.sbatch
   SETUP_SCRIPT   := slurm/setup_env.sh
+  SUBMIT_BACKEND := slurm
 else ifeq ($(TARGET),compute)
   REMOTE_HOST    := zcorn-compute
   REMOTE_USER    := zcorn
@@ -30,12 +33,25 @@ else ifeq ($(TARGET),compute)
   REMOTE_DATA    := ~/Projects/proteinDNA_data
   SBATCH_SCRIPT  := slurm/train-compute.sbatch
   SETUP_SCRIPT   := slurm/setup_env_compute.sh
+  SUBMIT_BACKEND := slurm
+else ifeq ($(TARGET),testgpu)
+  # SSH: Host testgpu → HostName gputest.igb.illinois.edu, User yumingz5 (see README)
+  REMOTE_HOST    := testgpu
+  REMOTE_USER    := yumingz5
+  REMOTE_PROJECT := ~/Projects/BioLLMComposition
+  REMOTE_DATA    := ~/Projects/proteinDNA_data
+  SETUP_SCRIPT   := slurm/setup_env_noslurm.sh
+  SUBMIT_BACKEND := direct
 else
-  $(error Unknown TARGET '$(TARGET)'. Use: cluster, compute)
+  $(error Unknown TARGET '$(TARGET)'. Use: cluster, compute, testgpu)
 endif
 
 # ── Derived ──────────────────────────────────────────────────────────────
-REMOTE           := $(REMOTE_HOST)
+ifeq ($(TARGET),testgpu)
+  REMOTE           := $(REMOTE_USER)@$(REMOTE_HOST)
+else
+  REMOTE           := $(REMOTE_HOST)
+endif
 REMOTE_DEST      := $(REMOTE):$(REMOTE_PROJECT)
 REMOTE_DATA_DEST := $(REMOTE):$(REMOTE_DATA)
 JOBS_CONF        := slurm/jobs.conf
@@ -95,10 +111,18 @@ endif
 	$(if $(ENTRY),,$(error Unknown JOB '$(JOB)'. Available: $$(cut -d= -f1 $(JOBS_CONF) | tr '\n' ' ')))
 	$(eval SCRIPT := $(word 1,$(subst |, ,$(lastword $(subst =, ,$(ENTRY))))))
 	$(eval CONFIG := $(word 2,$(subst |, ,$(lastword $(subst =, ,$(ENTRY))))))
+ifeq ($(SUBMIT_BACKEND),direct)
+	@echo "── [$(TARGET)] Starting $(JOB) via nohup (no SLURM): $(SCRIPT) + $(CONFIG) ──"
+	ssh $(REMOTE) 'cd $(REMOTE_PROJECT) && mkdir -p slurm/logs && LOG=slurm/logs/biollm-$(JOB)_$$(date +%Y%m%d_%H%M%S).out && nohup bash slurm/run-remote-train.sh $(SCRIPT) $(CONFIG) $(EXTRA) > $$LOG 2>&1 & echo "PID $$!  log $$LOG"'
+else
 	@echo "── [$(TARGET)] Submitting $(JOB): $(SCRIPT) + $(CONFIG) ──"
 	ssh $(REMOTE) 'cd $(REMOTE_PROJECT) && mkdir -p slurm/logs && sbatch --job-name=biollm-$(JOB) $(SBATCH_SCRIPT) $(SCRIPT) $(CONFIG) $(EXTRA)'
+endif
 
 submit-all: ## Submit all jobs defined in slurm/jobs.conf
+ifeq ($(SUBMIT_BACKEND),direct)
+	$(error submit-all needs SLURM; use TARGET=cluster or compute, or run jobs one-by-one: make submit JOB=... TARGET=testgpu)
+endif
 	@while IFS='=' read -r name rest; do \
 		[ -z "$$name" ] && continue; \
 		echo "── [$(TARGET)] Submitting $$name ──"; \
@@ -111,8 +135,13 @@ ARRAY ?= 8
 HPO_CONFIG ?= configs/training/composition_contactmap_focal_loss.yaml
 
 submit-hpo: ## Submit parallel HPO: make submit-hpo ARRAY=8 [EXTRA="--n_trials 40 --epochs 30"]
+ifeq ($(SUBMIT_BACKEND),direct)
+	@echo "── [$(TARGET)] HPO single-process (no SLURM array); ARRAY=$(ARRAY) ignored ──"
+	ssh $(REMOTE) 'cd $(REMOTE_PROJECT) && mkdir -p slurm/logs && LOG=slurm/logs/biollm-hpo_$$(date +%Y%m%d_%H%M%S).out && nohup bash slurm/run-remote-train.sh scripts/hpo_focal_loss.py $(HPO_CONFIG) $(EXTRA) > $$LOG 2>&1 & echo "PID $$!  log $$LOG"'
+else
 	@echo "── [$(TARGET)] Submitting HPO array ($(ARRAY) workers) ──"
 	ssh $(REMOTE) 'cd $(REMOTE_PROJECT) && mkdir -p slurm/logs && sbatch --array=0-$$(($(ARRAY)-1)) --job-name=biollm-hpo $(SBATCH_SCRIPT) scripts/hpo_focal_loss.py $(HPO_CONFIG) $(EXTRA)'
+endif
 
 # ── Local execution ─────────────────────────────────────────────────────
 run-local: ## Run a job locally: make run-local JOB=attention_focal [EXTRA="--lr 1e-4"]
@@ -137,8 +166,13 @@ wandb-sync: pull ## Pull offline W&B runs then upload them
 	@echo "── W&B sync complete ──"
 
 # ── Monitoring ──────────────────────────────────────────────────────────
-status: ## Check SLURM queue on remote
+status: ## Check SLURM queue on remote (or GPU/python on TARGET=testgpu)
+ifeq ($(SUBMIT_BACKEND),direct)
+	@echo "── [$(TARGET)] No SLURM — GPU apps and python training processes ──"
+	@ssh $(REMOTE) 'nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>/dev/null || nvidia-smi; echo; ps aux | grep -E "[p]ython.*(BioLLMComposition|/scripts/)" | head -20 || true'
+else
 	@ssh $(REMOTE) 'squeue -u $(REMOTE_USER) -o "%.10i %.20j %.8T %.10M %.6D %.4C %.10m %R"'
+endif
 
 logs: ## Tail a SLURM log: make logs JOB_ID=12345
 ifndef JOB_ID
@@ -148,11 +182,16 @@ else
 	@ssh $(REMOTE) 'tail -100 $(REMOTE_PROJECT)/slurm/logs/*_$(JOB_ID).out 2>/dev/null || echo "Log not found for job $(JOB_ID)"'
 endif
 
-cancel: ## Cancel a SLURM job: make cancel JOB_ID=12345
+cancel: ## Cancel job: SLURM scancel, or kill PID on TARGET=testgpu
 ifndef JOB_ID
 	$(error JOB_ID is required)
 endif
+ifeq ($(SUBMIT_BACKEND),direct)
+	@echo "── [$(TARGET)] kill PID $(JOB_ID) (use PID from submit output or status) ──"
+	@ssh $(REMOTE) 'kill $(JOB_ID) 2>/dev/null || kill -9 $(JOB_ID)' || true
+else
 	ssh $(REMOTE) 'scancel $(JOB_ID)'
+endif
 
 # ── Utilities ───────────────────────────────────────────────────────────
 ssh: ## Open interactive SSH session to remote

@@ -103,10 +103,33 @@ make submit JOB=composition_focal TARGET=compute EXTRA="--focal_alpha 0.9"
 make status TARGET=compute
 make logs TARGET=compute
 make pull TARGET=compute
+
+testgpu (IGB gputest, no SLURM, single GPU — like zcorn-compute but jobs run via `nohup`)
+Add this to `~/.ssh/config` on your laptop (Host name must match `testgpu`):
+
+```
+Host testgpu
+  HostName gputest.igb.illinois.edu
+  User yumingz5
+```
+
+First-time: `make setup TARGET=testgpu` (pushes code + data, runs `slurm/setup_env_noslurm.sh` — conda under `$HOME` or `CONDA_EXE`, no root).
+
+make push TARGET=testgpu
+make push-data TARGET=testgpu
+make submit JOB=composition_focal TARGET=testgpu
+make status TARGET=testgpu
+make logs TARGET=testgpu
+make pull TARGET=testgpu
+make cancel JOB_ID=<pid> TARGET=testgpu
+
+`submit` prints the remote PID and log path under `slurm/logs/`. `submit-hpo` runs a single HPO process (ARRAY is ignored). `submit-all` is disabled for this target.
+
 Sweep (all targets)
 # Focal loss grid search via the existing sweep script
 bash slurm/sweep-focal-loss.sh                    # biocluster (default)
 TARGET=compute bash slurm/sweep-focal-loss.sh      # zcorn-compute
+TARGET=testgpu bash slurm/sweep-focal-loss.sh    # many concurrent jobs — use --dry-run or one job at a time on one GPU
 bash slurm/sweep-focal-loss.sh --dry-run           # preview without submitting
 ClearML server management
 make server-status     # check containers
